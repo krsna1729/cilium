@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018 Authors of Cilium
+// Copyright Authors of Cilium
 
 package controller
 
@@ -9,14 +9,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-openapi/strfmt"
+	"github.com/sirupsen/logrus"
+
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/inctimer"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
-
-	"github.com/go-openapi/strfmt"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -50,6 +50,10 @@ type ControllerParams struct {
 	// An unset DoFunc is an error and will be logged as one.
 	DoFunc ControllerFunc
 
+	// CancelDoFuncOnUpdate when set to true cancels the controller context
+	// (the DoFunc) to allow quick termination of controller
+	CancelDoFuncOnUpdate bool
+
 	// StopFunc is called when the controller stops. It is intended to run any
 	// clean-up tasks for the controller (e.g. deallocate/release resources)
 	// It is guaranteed that DoFunc is called at least once before StopFunc is
@@ -63,6 +67,10 @@ type ControllerParams struct {
 	// specified interval. The interval starts from when the DoFunc has
 	// returned last
 	RunInterval time.Duration
+
+	// If set to any other value than 0, will cap the error retry interval
+	// to the specified interval.
+	MaxRetryInterval time.Duration
 
 	// ErrorRetryBaseDuration is the initial time to wait to run DoFunc
 	// again on return of an error. On each consecutive error, this value
@@ -101,29 +109,29 @@ func NoopFunc(ctx context.Context) error {
 // Controllers have a name and are tied to a Manager. The manager is typically
 // bound to higher level objects such as endpoint. These higher level objects
 // can then run multiple controllers to perform async tasks such as:
-//  - Annotating k8s resources with values
-//  - Synchronizing an object with the kvstore
-//  - Any other async operation to may fail and require retries
+//   - Annotating k8s resources with values
+//   - Synchronizing an object with the kvstore
+//   - Any other async operation to may fail and require retries
 //
 // Embedding the Manager into higher level resources allows to bind controllers
 // to the lifetime of that object. Controllers also have a UUID to allow
 // correlating all log messages of a controller instance.
 //
 // Guidelines to writing controllers:
-// * Make sure that the task the controller performs is done in an atomic
-//   fashion, e.g. if a controller modifies a resource in multiple steps, an
-//   intermediate manipulation operation failing should not leave behind
-//   an inconsistent state. This can typically be achieved by locking the
-//   resource and rolling back or by using transactions.
-// * Controllers typically act on behalf of a higher level object such as an
-//   endpoint. The controller must ensure that the higher level object is
-//   properly locked when accessing any fields.
-// * Controllers run asynchronously in the background, it is the responsibility
-//   of the controller to be aware of the lifecycle of the owning higher level
-//   object. This is typically achieved by removing all controllers when the
-//   owner dies. It is the responsibility of the owner to either lock the owner
-//   in a way that will delay destruction throughout the controller run or to
-//   check for the destruction throughout the run.
+//   - Make sure that the task the controller performs is done in an atomic
+//     fashion, e.g. if a controller modifies a resource in multiple steps, an
+//     intermediate manipulation operation failing should not leave behind
+//     an inconsistent state. This can typically be achieved by locking the
+//     resource and rolling back or by using transactions.
+//   - Controllers typically act on behalf of a higher level object such as an
+//     endpoint. The controller must ensure that the higher level object is
+//     properly locked when accessing any fields.
+//   - Controllers run asynchronously in the background, it is the responsibility
+//     of the controller to be aware of the lifecycle of the owning higher level
+//     object. This is typically achieved by removing all controllers when the
+//     owner dies. It is the responsibility of the owner to either lock the owner
+//     in a way that will delay destruction throughout the controller run or to
+//     check for the destruction throughout the run.
 type Controller struct {
 	mutex             lock.RWMutex
 	name              string
@@ -190,10 +198,12 @@ func (c *Controller) runController() {
 	errorRetries := 1
 
 	c.mutex.RLock()
+	ctx := c.ctxDoFunc
 	params := c.params
 	c.mutex.RUnlock()
 	runFunc := true
 	interval := 10 * time.Minute
+	maxRetryInterval := params.MaxRetryInterval
 	runTimer, timerDone := inctimer.New()
 	defer timerDone()
 
@@ -203,7 +213,7 @@ func (c *Controller) runController() {
 			interval = params.RunInterval
 
 			start := time.Now()
-			err = params.DoFunc(c.ctxDoFunc)
+			err = params.DoFunc(ctx)
 			duration := time.Since(start)
 
 			c.mutex.Lock()
@@ -211,6 +221,12 @@ func (c *Controller) runController() {
 			c.getLogger().Debug("Controller func execution time: ", c.lastDuration)
 
 			if err != nil {
+				if ctx.Err() != nil {
+					// The controller's context was canceled. Let's wait for the
+					// next controller update (or stop).
+					err = NewExitReason("controller context canceled")
+				}
+
 				switch err := err.(type) {
 				case ExitReason:
 					// This is actually not an error case, but it causes an exit
@@ -234,6 +250,14 @@ func (c *Controller) runController() {
 							interval = time.Duration(errorRetries) * params.ErrorRetryBaseDuration
 						} else {
 							interval = time.Duration(errorRetries) * time.Second
+						}
+
+						if maxRetryInterval > 0 && interval > maxRetryInterval {
+							c.getLogger().WithFields(logrus.Fields{
+								"calculatedInterval": interval,
+								"maxAllowedInterval": maxRetryInterval,
+							}).Debug("Cap retry interval to max allowed value")
+							interval = maxRetryInterval
 						}
 
 						errorRetries++
@@ -276,6 +300,7 @@ func (c *Controller) runController() {
 			// Pick up any changes to the parameters in case the controller has
 			// been updated.
 			c.mutex.RLock()
+			ctx = c.ctxDoFunc
 			params = c.params
 			c.mutex.RUnlock()
 			runFunc = true
@@ -305,6 +330,17 @@ shutdown:
 //
 // If the RunInterval exceeds ControllerMaxInterval, it will be capped.
 func (c *Controller) updateParamsLocked(params ControllerParams) {
+	if c.params.CancelDoFuncOnUpdate && c.cancelDoFunc != nil {
+		c.cancelDoFunc()
+
+		// (re)set the context as the previous might have been cancelled
+		if params.Context == nil {
+			c.ctxDoFunc, c.cancelDoFunc = context.WithCancel(context.Background())
+		} else {
+			c.ctxDoFunc, c.cancelDoFunc = context.WithCancel(params.Context)
+		}
+	}
+
 	c.params = params
 
 	maxInterval := time.Duration(option.Config.MaxControllerInterval) * time.Second

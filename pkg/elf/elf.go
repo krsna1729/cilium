@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2021 Authors of Cilium
+// Copyright Authors of Cilium
 
 package elf
 
@@ -12,9 +12,9 @@ import (
 	"strings"
 	"unsafe"
 
-	"github.com/cilium/cilium/pkg/lock"
-
 	"github.com/sirupsen/logrus"
+
+	"github.com/cilium/cilium/pkg/lock"
 )
 
 var (
@@ -103,15 +103,6 @@ func (elf *ELF) Close() (err error) {
 	return err
 }
 
-func (elf *ELF) readValue(offset int64, size int64) ([]byte, error) {
-	reader := io.NewSectionReader(elf.file, offset, size)
-	result := make([]byte, size)
-	if err := binary.Read(reader, elf.metadata.ByteOrder, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
 func (elf *ELF) writeValue(w io.WriteSeeker, offset uint64, value []byte) error {
 	if _, err := w.Seek(int64(offset), io.SeekStart); err != nil {
 		return err
@@ -119,35 +110,12 @@ func (elf *ELF) writeValue(w io.WriteSeeker, offset uint64, value []byte) error 
 	return binary.Write(w, elf.metadata.ByteOrder, value)
 }
 
-func (elf *ELF) readOption(key string) (result uint32, err error) {
-	opt, exists := elf.symbols.data[key]
-	if !exists {
-		return 0, fmt.Errorf("no such option %q in ELF", key)
-	}
-	value, err := elf.readValue(int64(opt.offset), int64(opt.size))
-	if err != nil {
-		return 0, err
-	}
-	return elf.metadata.ByteOrder.Uint32(value), err
-}
-
-func (elf *ELF) findString(key string) error {
-	opt, exists := elf.symbols.strings[key]
-	if !exists {
-		return fmt.Errorf("no such string %q in ELF", key)
-	}
-	if _, err := elf.readValue(int64(opt.offset), int64(opt.size)); err != nil {
-		return err
-	}
-	return nil
-}
-
 // copy the ELF from the reader to the writer, substituting the constants with
 // names specified in 'intOptions' with their corresponding values, and the
 // strings specified in 'strOptions' with their corresponding values.
 //
 // Keys in the 'intOptions' / 'strOptions' maps are case-sensitive.
-func (elf *ELF) copy(w io.WriteSeeker, r *io.SectionReader, intOptions map[string]uint32, strOptions map[string]string) error {
+func (elf *ELF) copy(w io.WriteSeeker, r *io.SectionReader, intOptions map[string]uint64, strOptions map[string]string) error {
 	if len(intOptions) == 0 && len(strOptions) == 0 {
 		// Copy the remaining portion of the file
 		if _, err := io.Copy(w, r); err != nil {
@@ -170,11 +138,19 @@ processSymbols:
 		// Figure out the value to substitute
 		var value []byte
 		switch symbol.kind {
-		case symbolUint32:
-			v, exists := intOptions[symbol.name]
-			if exists {
-				value = make([]byte, unsafe.Sizeof(v))
-				elf.metadata.ByteOrder.PutUint32(value, v)
+		case symbolData:
+			if v, exists := intOptions[symbol.name]; exists {
+				value = make([]byte, symbol.size)
+				switch uintptr(symbol.size) {
+				case unsafe.Sizeof(uint64(0)):
+					elf.metadata.ByteOrder.PutUint64(value, v)
+				case unsafe.Sizeof(uint32(0)):
+					elf.metadata.ByteOrder.PutUint32(value, uint32(v))
+				case unsafe.Sizeof(uint16(0)):
+					elf.metadata.ByteOrder.PutUint16(value, uint16(v))
+				default:
+					return fmt.Errorf("substitute symbol %s: unsupported size %d", symbol.name, symbol.size)
+				}
 			}
 
 		case symbolString:
@@ -228,15 +204,15 @@ processSymbols:
 
 // Write the received ELF to a new file at the specified location, with the
 // specified options (indexed by name) substituted:
-// - intOptions: 32-bit values substituted in the data section.
-// - strOptions: strings susbtituted in the string table. For each key/value
-//               pair, both key and value must be same length.
+//   - intOptions: 32-bit values substituted in the data section.
+//   - strOptions: strings susbtituted in the string table. For each key/value
+//     pair, both key and value must be same length.
 //
 // Only one goroutine may Write() the same *ELF concurrently.
 //
 // On success, writes the new file to the specified path.
 // On failure, returns an error and no file is left on the filesystem.
-func (elf *ELF) Write(path string, intOptions map[string]uint32, strOptions map[string]string) error {
+func (elf *ELF) Write(path string, intOptions map[string]uint64, strOptions map[string]string) error {
 	elf.Lock()
 	defer elf.Unlock()
 

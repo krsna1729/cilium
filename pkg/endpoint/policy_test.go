@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2021 Authors of Cilium
-
-//go:build !privileged_tests && integration_tests
-// +build !privileged_tests,integration_tests
+// Copyright Authors of Cilium
 
 package endpoint
 
 import (
+	check "github.com/cilium/checkmate"
+
 	"github.com/cilium/cilium/pkg/policy"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
+	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
 	"github.com/cilium/cilium/pkg/u8proto"
-
-	"gopkg.in/check.v1"
 )
 
 func (s *EndpointSuite) TestUpdateVisibilityPolicy(c *check.C) {
-	ep := NewEndpointWithState(&DummyOwner{repo: policy.NewPolicyRepository(nil, nil, nil)}, nil, testidentity.NewFakeIdentityAllocator(nil), 12345, StateReady)
+	do := &DummyOwner{repo: policy.NewPolicyRepository(nil, nil, nil, nil)}
+	ep := NewEndpointWithState(do, do, testipcache.NewMockIPCache(), nil, testidentity.NewMockIdentityAllocator(nil), 12345, StateReady)
 	ep.UpdateVisibilityPolicy(func(_, _ string) (string, error) {
 		return "", nil
 	})

@@ -1,35 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2021 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package elf
 
 import (
 	"bytes"
 	"crypto/sha256"
-	"errors"
+	"encoding/binary"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 
+	. "github.com/cilium/checkmate"
+
 	"github.com/cilium/ebpf"
 
-	. "gopkg.in/check.v1"
+	"github.com/cilium/cilium/pkg/testutils"
 )
 
 // Hook up gocheck into the "go test" runner.
 type ELFTestSuite struct{}
 
-var (
-	_ = Suite(&ELFTestSuite{})
+var _ = Suite(&ELFTestSuite{})
 
-	baseObjPath = filepath.Join("..", "..", "test", "bpf", "elf-demo.o")
-)
+func (s *ELFTestSuite) SetUpSuite(c *C) {
+	testutils.IntegrationCheck(c)
+}
+
+var baseObjPath = filepath.Join("..", "..", "test", "bpf", "elf-demo.o")
 
 const elfObjCopy = "elf-demo-copy.o"
 
@@ -85,7 +85,7 @@ func (s *ELFTestSuite) TestWrite(c *C) {
 		description  string
 		key          string
 		kind         symbolKind
-		intValue     uint32
+		intValue     uint64
 		strValue     string
 		elfValid     Checker
 		elfChangeErr error
@@ -98,7 +98,7 @@ func (s *ELFTestSuite) TestWrite(c *C) {
 		{
 			description:  "test constant substitution 1",
 			key:          "FOO",
-			kind:         symbolUint32,
+			kind:         symbolData,
 			intValue:     42,
 			elfValid:     validOptions,
 			elfChangeErr: errDifferentFiles,
@@ -106,7 +106,7 @@ func (s *ELFTestSuite) TestWrite(c *C) {
 		{
 			description:  "test constant substitution 2",
 			key:          "BAR",
-			kind:         symbolUint32,
+			kind:         symbolData,
 			intValue:     42,
 			elfValid:     validOptions,
 			elfChangeErr: errDifferentFiles,
@@ -128,11 +128,11 @@ func (s *ELFTestSuite) TestWrite(c *C) {
 		},
 	}
 
-	for i := 1; i <= 4; i++ {
+	for i := 1; i <= 2; i++ {
 		testOptions = append(testOptions, testOption{
 			description:  fmt.Sprintf("test ipv6 substitution %d", i),
 			key:          fmt.Sprintf("GLOBAL_IPV6_%d", i),
-			kind:         symbolUint32,
+			kind:         symbolData,
 			intValue:     42,
 			elfValid:     validOptions,
 			elfChangeErr: errDifferentFiles,
@@ -143,7 +143,7 @@ func (s *ELFTestSuite) TestWrite(c *C) {
 		testOptions = append(testOptions, testOption{
 			description:  fmt.Sprintf("test mac substitution %d", i),
 			key:          fmt.Sprintf("LOCAL_MAC_%d", i),
-			kind:         symbolUint32,
+			kind:         symbolData,
 			intValue:     42,
 			elfValid:     validOptions,
 			elfChangeErr: errDifferentFiles,
@@ -154,10 +154,10 @@ func (s *ELFTestSuite) TestWrite(c *C) {
 		c.Logf("%s", test.description)
 
 		// Create the copy of the ELF with an optional substitution
-		intOptions := make(map[string]uint32)
+		intOptions := make(map[string]uint64)
 		strOptions := make(map[string]string)
 		switch test.kind {
-		case symbolUint32:
+		case symbolData:
 			intOptions[test.key] = test.intValue
 		case symbolString:
 			strOptions[test.key] = test.strValue
@@ -182,7 +182,7 @@ func (s *ELFTestSuite) TestWrite(c *C) {
 		defer modifiedElf.Close()
 
 		switch test.kind {
-		case symbolUint32:
+		case symbolData:
 			value, err := modifiedElf.readOption(test.key)
 			c.Assert(err, IsNil)
 			c.Assert(value, Equals, test.intValue)
@@ -206,18 +206,14 @@ func BenchmarkWriteELF(b *testing.B) {
 	defer os.RemoveAll(tmpDir)
 
 	elf, err := Open(baseObjPath)
-	if errors.Is(err, fs.ErrNotExist) {
-		// If the ELF file couldn't be found most likely it
-		// wasn't built. See https://github.com/cilium/cilium/issues/17535
-		b.Skip("ELF file not found, skipping benchmark")
-	} else if err != nil {
+	if err != nil {
 		b.Fatal(err)
 	}
 	defer elf.Close()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		intOptions := make(map[string]uint32)
+		intOptions := make(map[string]uint64)
 		strOptions := make(map[string]string)
 
 		objectCopy := filepath.Join(tmpDir, fmt.Sprintf("%d_%s", i, elfObjCopy))
@@ -225,4 +221,39 @@ func BenchmarkWriteELF(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func (elf *ELF) findString(key string) error {
+	opt, exists := elf.symbols.strings[key]
+	if !exists {
+		return fmt.Errorf("no such string %q in ELF", key)
+	}
+	if _, err := elf.readValue(int64(opt.offset), int64(opt.size)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (elf *ELF) readOption(key string) (result uint64, err error) {
+	opt, exists := elf.symbols.data[key]
+	if !exists {
+		return 0, fmt.Errorf("no such option %q in ELF", key)
+	}
+	value, err := elf.readValue(int64(opt.offset), int64(opt.size))
+	if err != nil {
+		return 0, err
+	}
+
+	out := make([]byte, 8)
+	copy(out, value)
+	return elf.metadata.ByteOrder.Uint64(out), err
+}
+
+func (elf *ELF) readValue(offset int64, size int64) ([]byte, error) {
+	reader := io.NewSectionReader(elf.file, offset, size)
+	result := make([]byte, size)
+	if err := binary.Read(reader, elf.metadata.ByteOrder, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }

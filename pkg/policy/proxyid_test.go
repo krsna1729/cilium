@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package policy
 
 import (
-	. "gopkg.in/check.v1"
+	. "github.com/cilium/checkmate"
 )
 
 func (s *PolicyTestSuite) TestProxyID(c *C) {

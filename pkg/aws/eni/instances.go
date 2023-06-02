@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019 Authors of Cilium
+// Copyright Authors of Cilium
+
 // Copyright 2017 Lyft, Inc.
 
 package eni
@@ -8,14 +9,14 @@ import (
 	"context"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	"github.com/cilium/cilium/pkg/aws/types"
 	"github.com/cilium/cilium/pkg/ipam"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/lock"
-
-	"github.com/sirupsen/logrus"
 )
 
 // EC2API is the API surface used of the EC2 API
@@ -24,12 +25,15 @@ type EC2API interface {
 	GetSubnets(ctx context.Context) (ipamTypes.SubnetMap, error)
 	GetVpcs(ctx context.Context) (ipamTypes.VirtualNetworkMap, error)
 	GetSecurityGroups(ctx context.Context) (types.SecurityGroupMap, error)
-	CreateNetworkInterface(ctx context.Context, toAllocate int32, subnetID, desc string, groups []string) (string, *eniTypes.ENI, error)
+	GetDetachedNetworkInterfaces(ctx context.Context, tags ipamTypes.Tags, maxResults int32) ([]string, error)
+	CreateNetworkInterface(ctx context.Context, toAllocate int32, subnetID, desc string, groups []string, allocatePrefixes bool) (string, *eniTypes.ENI, error)
 	AttachNetworkInterface(ctx context.Context, index int32, instanceID, eniID string) (string, error)
 	DeleteNetworkInterface(ctx context.Context, eniID string) error
 	ModifyNetworkInterface(ctx context.Context, eniID, attachmentID string, deleteOnTermination bool) error
 	AssignPrivateIpAddresses(ctx context.Context, eniID string, addresses int32) error
 	UnassignPrivateIpAddresses(ctx context.Context, eniID string, addresses []string) error
+	AssignENIPrefixes(ctx context.Context, eniID string, prefixes int32) error
+	UnassignENIPrefixes(ctx context.Context, eniID string, prefixes []string) error
 }
 
 // InstancesManager maintains the list of instances. It must be kept up to date
@@ -55,6 +59,13 @@ func NewInstancesManager(api EC2API) *InstancesManager {
 // allocation implementation for the new node
 func (m *InstancesManager) CreateNode(obj *v2.CiliumNode, n *ipam.Node) ipam.NodeOperations {
 	return NewNode(n, obj, m)
+}
+
+// HasInstance returns whether the instance is in instances
+func (m *InstancesManager) HasInstance(instanceID string) bool {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.instances.Exists(instanceID)
 }
 
 // GetPoolQuota returns the number of available IPs in all IP pools
@@ -211,8 +222,9 @@ func (m *InstancesManager) UpdateENI(instanceID string, eni *eniTypes.ENI) {
 	m.mutex.Unlock()
 }
 
-// ForeachInstance will iterate over each instance inside `instances`, and call
-// `fn`. This function is read-locked for the entire execution.
+// ForeachInstance will iterate over each interface for a particular instance inside `instances`
+// and call `fn`.
+// This function is read-locked for the entire execution.
 func (m *InstancesManager) ForeachInstance(instanceID string, fn ipamTypes.InterfaceIterator) {
 	// This is a safety net in case the InstanceID is not known for some
 	// reason. If we don't know the instanceID, we also can't derive the
@@ -226,4 +238,11 @@ func (m *InstancesManager) ForeachInstance(instanceID string, fn ipamTypes.Inter
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 	m.instances.ForeachInterface(instanceID, fn)
+}
+
+// DeleteInstance delete instance from m.instances
+func (m *InstancesManager) DeleteInstance(instanceID string) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.instances.Delete(instanceID)
 }

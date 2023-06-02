@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2017-2019 Authors of Cilium
+// Copyright Authors of Cilium
 
 package server
 
 import (
 	"fmt"
+	"path"
 	"time"
 
 	"github.com/cilium/cilium/api/v1/client/daemon"
@@ -12,14 +13,16 @@ import (
 	healthApi "github.com/cilium/cilium/api/v1/health/server"
 	"github.com/cilium/cilium/api/v1/health/server/restapi"
 	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/pkg/api"
 	ciliumPkg "github.com/cilium/cilium/pkg/client"
+	ciliumDefaults "github.com/cilium/cilium/pkg/defaults"
+	healthClientPkg "github.com/cilium/cilium/pkg/health/client"
 	"github.com/cilium/cilium/pkg/health/defaults"
 	"github.com/cilium/cilium/pkg/health/probe/responder"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-
-	"github.com/go-openapi/loads"
+	"github.com/cilium/cilium/pkg/metrics"
 )
 
 var (
@@ -33,12 +36,13 @@ type Config struct {
 	ProbeInterval time.Duration
 	ProbeDeadline time.Duration
 	HTTPPathPort  int
+	HealthAPISpec *healthApi.Spec
 }
 
 // ipString is an IP address used as a more descriptive type name in maps.
 type ipString string
 
-// nodeMap maps IP addresses to healthNode objectss for convenient access to
+// nodeMap maps IP addresses to healthNode objects for convenient access to
 // node information.
 type nodeMap map[ipString]healthNode
 
@@ -170,7 +174,112 @@ func (s *Server) updateCluster(report *healthReport) {
 
 	if s.connectivity.startTime.Before(report.startTime) {
 		s.connectivity = report
+		s.collectNodeConnectivityMetrics()
 	}
+}
+
+func (s *Server) collectNodeConnectivityMetrics() {
+	if s.localStatus == nil || s.connectivity == nil {
+		return
+	}
+	localClusterName, localNodeName := getClusterNodeName(s.localStatus.Name)
+
+	for _, n := range s.connectivity.nodes {
+		if n == nil || n.Host == nil || n.Host.PrimaryAddress == nil || n.HealthEndpoint == nil || n.HealthEndpoint.PrimaryAddress == nil {
+			continue
+		}
+
+		targetClusterName, targetNodeName := getClusterNodeName(n.Name)
+		nodePathPrimaryAddress := healthClientPkg.GetHostPrimaryAddress(n)
+		nodePathSecondaryAddress := healthClientPkg.GetHostSecondaryAddresses(n)
+
+		endpointPathStatus := n.HealthEndpoint
+		isEndpointReachable := healthClientPkg.SummarizePathConnectivityStatusType(healthClientPkg.GetAllEndpointAddresses(n)) == healthClientPkg.ConnStatusReachable
+		isNodeReachable := healthClientPkg.SummarizePathConnectivityStatusType(healthClientPkg.GetAllHostAddresses(n)) == healthClientPkg.ConnStatusReachable
+
+		location := metrics.LabelLocationLocalNode
+		if targetClusterName != localClusterName {
+			location = metrics.LabelLocationRemoteInterCluster
+		} else if targetNodeName != localNodeName {
+			location = metrics.LabelLocationRemoteIntraCluster
+		}
+
+		// Aggregated status for endpoint connectivity
+		metrics.NodeConnectivityStatus.WithLabelValues(
+			localClusterName, localNodeName, targetClusterName, targetNodeName, location, metrics.LabelPeerEndpoint).
+			Set(metrics.BoolToFloat64(isEndpointReachable))
+
+		// Aggregated status for node connectivity
+		metrics.NodeConnectivityStatus.WithLabelValues(
+			localClusterName, localNodeName, targetClusterName, targetNodeName, location, metrics.LabelPeerNode).
+			Set(metrics.BoolToFloat64(isNodeReachable))
+
+		// HTTP endpoint primary
+		collectConnectivityMetric(endpointPathStatus.PrimaryAddress.HTTP, localClusterName, localNodeName,
+			targetClusterName, targetNodeName, endpointPathStatus.PrimaryAddress.IP,
+			location, metrics.LabelPeerEndpoint, metrics.LabelTrafficHTTP, metrics.LabelAddressTypePrimary)
+
+		// HTTP endpoint secondary
+		for _, secondary := range endpointPathStatus.SecondaryAddresses {
+			collectConnectivityMetric(secondary.HTTP, localClusterName, localNodeName,
+				targetClusterName, targetNodeName, secondary.IP,
+				location, metrics.LabelPeerEndpoint, metrics.LabelTrafficHTTP, metrics.LabelAddressTypeSecondary)
+		}
+
+		// HTTP node primary
+		collectConnectivityMetric(nodePathPrimaryAddress.HTTP, localClusterName, localNodeName,
+			targetClusterName, targetNodeName, nodePathPrimaryAddress.IP,
+			location, metrics.LabelPeerNode, metrics.LabelTrafficHTTP, metrics.LabelAddressTypePrimary)
+
+		// HTTP node secondary
+		for _, secondary := range nodePathSecondaryAddress {
+			collectConnectivityMetric(secondary.HTTP, localClusterName, localNodeName,
+				targetClusterName, targetNodeName, secondary.IP,
+				location, metrics.LabelPeerNode, metrics.LabelTrafficHTTP, metrics.LabelAddressTypeSecondary)
+		}
+
+		// ICMP endpoint primary
+		collectConnectivityMetric(endpointPathStatus.PrimaryAddress.Icmp, localClusterName, localNodeName,
+			targetClusterName, targetNodeName, endpointPathStatus.PrimaryAddress.IP,
+			location, metrics.LabelPeerEndpoint, metrics.LabelTrafficICMP, metrics.LabelAddressTypePrimary)
+
+		// ICMP endpoint secondary
+		for _, secondary := range endpointPathStatus.SecondaryAddresses {
+			collectConnectivityMetric(secondary.Icmp, localClusterName, localNodeName,
+				targetClusterName, targetNodeName, secondary.IP,
+				location, metrics.LabelPeerEndpoint, metrics.LabelTrafficICMP, metrics.LabelAddressTypeSecondary)
+		}
+
+		// ICMP node primary
+		collectConnectivityMetric(nodePathPrimaryAddress.Icmp, localClusterName, localNodeName,
+			targetClusterName, targetNodeName, nodePathPrimaryAddress.IP,
+			location, metrics.LabelPeerNode, metrics.LabelTrafficICMP, metrics.LabelAddressTypePrimary)
+
+		// ICMP node secondary
+		for _, secondary := range nodePathSecondaryAddress {
+			collectConnectivityMetric(secondary.Icmp, localClusterName, localNodeName,
+				targetClusterName, targetNodeName, secondary.IP,
+				location, metrics.LabelPeerNode, metrics.LabelTrafficICMP, metrics.LabelAddressTypeSecondary)
+		}
+	}
+}
+
+func collectConnectivityMetric(status *healthModels.ConnectivityStatus, labels ...string) {
+	var metricValue float64 = -1
+	if status != nil {
+		metricValue = float64(status.Latency) / float64(time.Second)
+	}
+	metrics.NodeConnectivityLatency.WithLabelValues(labels...).Set(metricValue)
+}
+
+// getClusterNodeName returns the cluster name and node name if possible.
+func getClusterNodeName(str string) (string, string) {
+	clusterName, nodeName := path.Split(str)
+	if len(clusterName) == 0 {
+		return ciliumDefaults.ClusterName, nodeName
+	}
+	// remove forward slash at the end if any for cluster name
+	return path.Dir(clusterName), nodeName
 }
 
 // GetStatusResponse returns the most recent cluster connectivity status.
@@ -243,10 +352,10 @@ func (s *Server) runActiveServices() error {
 }
 
 // Serve spins up the following goroutines:
-// * HTTP API Server: Responder to the health API "/hello" message
-// * Prober: Periodically run pings across the cluster at a configured interval
-//   and update the server's connectivity status cache.
-// * Unix API Server: Handle all health API requests over a unix socket.
+//   - HTTP API Server: Responder to the health API "/hello" message
+//   - Prober: Periodically run pings across the cluster at a configured interval
+//     and update the server's connectivity status cache.
+//   - Unix API Server: Handle all health API requests over a unix socket.
 //
 // Callers should first defer the Server.Shutdown(), then call Serve().
 func (s *Server) Serve() (err error) {
@@ -273,16 +382,17 @@ func (s *Server) Shutdown() {
 
 // newServer instantiates a new instance of the health API server on the
 // defaults unix socket.
-func (s *Server) newServer(spec *loads.Document) *healthApi.Server {
-	api := restapi.NewCiliumHealthAPIAPI(spec)
-	api.Logger = log.Printf
+func (s *Server) newServer(spec *healthApi.Spec) *healthApi.Server {
+	restAPI := restapi.NewCiliumHealthAPIAPI(spec.Document)
+	restAPI.Logger = log.Printf
 
 	// Admin API
-	api.GetHealthzHandler = NewGetHealthzHandler(s)
-	api.ConnectivityGetStatusHandler = NewGetStatusHandler(s)
-	api.ConnectivityPutStatusProbeHandler = NewPutStatusProbeHandler(s)
+	restAPI.GetHealthzHandler = NewGetHealthzHandler(s)
+	restAPI.ConnectivityGetStatusHandler = NewGetStatusHandler(s)
+	restAPI.ConnectivityPutStatusProbeHandler = NewPutStatusProbeHandler(s)
 
-	srv := healthApi.NewServer(api)
+	api.DisableAPIs(spec.DeniedAPIs, restAPI.AddMiddlewareFor)
+	srv := healthApi.NewServer(restAPI)
 	srv.EnabledListeners = []string{"unix"}
 	srv.SocketPath = defaults.SockPath
 
@@ -299,18 +409,13 @@ func NewServer(config Config) (*Server, error) {
 		connectivity: &healthReport{},
 	}
 
-	swaggerSpec, err := loads.Analyzed(healthApi.SwaggerJSON, "")
-	if err != nil {
-		return nil, err
-	}
-
 	cl, err := ciliumPkg.NewClient(config.CiliumURI)
 	if err != nil {
 		return nil, err
 	}
 
 	server.Client = cl
-	server.Server = *server.newServer(swaggerSpec)
+	server.Server = *server.newServer(config.HealthAPISpec)
 
 	server.httpPathServer = responder.NewServer(config.HTTPPathPort)
 

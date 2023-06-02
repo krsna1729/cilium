@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2018 Authors of Cilium
+// Copyright Authors of Cilium
 
 package cache
 
@@ -10,6 +10,7 @@ import (
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/allocator"
 	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/identity/key"
 	identitymodel "github.com/cilium/cilium/pkg/identity/model"
 	"github.com/cilium/cilium/pkg/idpool"
 	"github.com/cilium/cilium/pkg/kvstore"
@@ -54,7 +55,7 @@ func (m *CachingIdentityAllocator) GetIdentityCache() IdentityCache {
 	if m.isGlobalIdentityAllocatorInitialized() {
 		m.IdentityAllocator.ForeachCache(func(id idpool.ID, val allocator.AllocatorKey) {
 			if val != nil {
-				if gi, ok := val.(GlobalIdentity); ok {
+				if gi, ok := val.(*key.GlobalIdentity); ok {
 					cache[identity.NumericIdentity(id)] = gi.LabelArray
 				} else {
 					log.Warningf("Ignoring unknown identity type '%s': %+v",
@@ -64,14 +65,12 @@ func (m *CachingIdentityAllocator) GetIdentityCache() IdentityCache {
 		})
 	}
 
-	for key, identity := range identity.ReservedIdentityCache {
-		cache[key] = identity.Labels.LabelArray()
-	}
+	identity.IterateReservedIdentities(func(ni identity.NumericIdentity, id *identity.Identity) {
+		cache[ni] = id.Labels.LabelArray()
+	})
 
-	if m.isLocalIdentityAllocatorInitialized() {
-		for _, identity := range m.localIdentities.GetIdentities() {
-			cache[identity.ID] = identity.Labels.LabelArray()
-		}
+	for _, identity := range m.localIdentities.GetIdentities() {
+		cache[identity.ID] = identity.Labels.LabelArray()
 	}
 
 	return cache
@@ -83,29 +82,26 @@ func (m *CachingIdentityAllocator) GetIdentities() IdentitiesModel {
 
 	if m.isGlobalIdentityAllocatorInitialized() {
 		m.IdentityAllocator.ForeachCache(func(id idpool.ID, val allocator.AllocatorKey) {
-			if gi, ok := val.(GlobalIdentity); ok {
+			if gi, ok := val.(*key.GlobalIdentity); ok {
 				identity := identity.NewIdentityFromLabelArray(identity.NumericIdentity(id), gi.LabelArray)
 				identities = append(identities, identitymodel.CreateModel(identity))
 			}
 
 		})
 	}
-	// append user reserved identities
-	for _, v := range identity.ReservedIdentityCache {
+	identity.IterateReservedIdentities(func(ni identity.NumericIdentity, id *identity.Identity) {
+		identities = append(identities, identitymodel.CreateModel(id))
+	})
+
+	for _, v := range m.localIdentities.GetIdentities() {
 		identities = append(identities, identitymodel.CreateModel(v))
 	}
 
-	if m.isLocalIdentityAllocatorInitialized() {
-		for _, v := range m.localIdentities.GetIdentities() {
-			identities = append(identities, identitymodel.CreateModel(v))
-		}
-	}
 	return identities
 }
 
 type identityWatcher struct {
-	stopChan chan struct{}
-	owner    IdentityAllocatorOwner
+	owner IdentityAllocatorOwner
 }
 
 // collectEvent records the 'event' as an added or deleted identity,
@@ -115,7 +111,7 @@ func collectEvent(event allocator.AllocatorEvent, added, deleted IdentityCache) 
 	id := identity.NumericIdentity(event.ID)
 	// Only create events have the key
 	if event.Typ == kvstore.EventTypeCreate {
-		if gi, ok := event.Key.(GlobalIdentity); ok {
+		if gi, ok := event.Key.(*key.GlobalIdentity); ok {
 			// Un-delete the added ID if previously
 			// 'deleted' so that collected events can be
 			// processed in any order.
@@ -138,13 +134,12 @@ func collectEvent(event allocator.AllocatorEvent, added, deleted IdentityCache) 
 }
 
 // watch starts the identity watcher
-func (w *identityWatcher) watch(events allocator.AllocatorEventChan) {
+func (w *identityWatcher) watch(events allocator.AllocatorEventRecvChan) {
 
 	go func() {
 		for {
 			added := IdentityCache{}
 			deleted := IdentityCache{}
-
 		First:
 			for {
 				// Wait for one identity add or delete or stop
@@ -164,8 +159,6 @@ func (w *identityWatcher) watch(events allocator.AllocatorEventChan) {
 					default:
 						// Ignore modify events
 					}
-				case <-w.stopChan:
-					return
 				}
 			}
 
@@ -196,21 +189,6 @@ func (w *identityWatcher) watch(events allocator.AllocatorEventChan) {
 	}()
 }
 
-// stop stops the identity watcher
-func (w *identityWatcher) stop() {
-	close(w.stopChan)
-}
-
-// isLocalIdentityAllocatorInitialized returns true if m.localIdentities is not nil.
-func (m *CachingIdentityAllocator) isLocalIdentityAllocatorInitialized() bool {
-	select {
-	case <-m.localIdentityAllocatorInitialized:
-		return m.localIdentities != nil
-	default:
-		return false
-	}
-}
-
 // isGlobalIdentityAllocatorInitialized returns true if m.IdentityAllocator is not nil.
 // Note: This does not mean that the identities have been synchronized,
 // see WaitForInitialGlobalIdentities to wait for a fully populated cache.
@@ -232,20 +210,16 @@ func (m *CachingIdentityAllocator) LookupIdentity(ctx context.Context, lbls labe
 		return reservedIdentity
 	}
 
-	if !m.isLocalIdentityAllocatorInitialized() {
-		return nil
+	if !identity.RequiresGlobalIdentity(lbls) {
+		return m.localIdentities.lookup(lbls)
 	}
 
-	if identity := m.localIdentities.lookup(lbls); identity != nil {
-		return identity
-	}
-
-	if !identity.RequiresGlobalIdentity(lbls) || !m.isGlobalIdentityAllocatorInitialized() {
+	if !m.isGlobalIdentityAllocatorInitialized() {
 		return nil
 	}
 
 	lblArray := lbls.LabelArray()
-	id, err := m.IdentityAllocator.GetIncludeRemoteCaches(ctx, GlobalIdentity{lblArray})
+	id, err := m.IdentityAllocator.GetIncludeRemoteCaches(ctx, &key.GlobalIdentity{LabelArray: lblArray})
 	if err != nil {
 		return nil
 	}
@@ -275,15 +249,11 @@ func (m *CachingIdentityAllocator) LookupIdentityByID(ctx context.Context, id id
 		return identity
 	}
 
-	if !m.isLocalIdentityAllocatorInitialized() {
-		return nil
+	if id.HasLocalScope() {
+		return m.localIdentities.lookupByID(id)
 	}
 
-	if identity := m.localIdentities.lookupByID(id); identity != nil {
-		return identity
-	}
-
-	if !m.isGlobalIdentityAllocatorInitialized() || id.HasLocalScope() {
+	if !m.isGlobalIdentityAllocatorInitialized() {
 		return nil
 	}
 
@@ -292,7 +262,7 @@ func (m *CachingIdentityAllocator) LookupIdentityByID(ctx context.Context, id id
 		return nil
 	}
 
-	if gi, ok := allocatorKey.(GlobalIdentity); ok {
+	if gi, ok := allocatorKey.(*key.GlobalIdentity); ok {
 		return identity.NewIdentityFromLabelArray(id, gi.LabelArray)
 	}
 

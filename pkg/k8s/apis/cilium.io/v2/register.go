@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2017-2021 Authors of Cilium
+// Copyright Authors of Cilium
 
 package v2
 
 import (
-	k8sconst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	k8sconst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 )
 
 const (
@@ -18,20 +18,7 @@ const (
 	// CustomResourceDefinitionVersion is the current version of the resource
 	CustomResourceDefinitionVersion = "v2"
 
-	// CustomResourceDefinitionSchemaVersion is semver-conformant version of CRD schema
-	// Used to determine if CRD needs to be updated in cluster
-	//
-	// Maintainers: Run ./Documentation/check-crd-compat-table.sh for each release
-	// Developers: Bump patch for each change in the CRD schema.
-	CustomResourceDefinitionSchemaVersion = "1.24.1"
-
-	// CustomResourceDefinitionSchemaVersionKey is key to label which holds the CRD schema version
-	CustomResourceDefinitionSchemaVersionKey = "io.cilium.k8s.crd.schema.version"
-
 	// Cilium Network Policy (CNP)
-
-	// CNPSingularName is the singular name of Cilium Network Policy
-	CNPSingularName = "ciliumnetworkpolicy"
 
 	// CNPPluralName is the plural name of Cilium Network Policy
 	CNPPluralName = "ciliumnetworkpolicies"
@@ -44,9 +31,6 @@ const (
 
 	// Cilium Cluster wide Network Policy (CCNP)
 
-	// CCNPSingularName is the singular name of Cilium Cluster wide Network Policy
-	CCNPSingularName = "ciliumclusterwidenetworkpolicy"
-
 	// CCNPPluralName is the plural name of Cilium Cluster wide Network Policy
 	CCNPPluralName = "ciliumclusterwidenetworkpolicies"
 
@@ -56,10 +40,18 @@ const (
 	// CCNPName is the full name of Cilium Cluster wide Network Policy
 	CCNPName = CCNPPluralName + "." + CustomResourceDefinitionGroup
 
-	// Cilium Endpoint (CEP)
+	// Cilium Egress Gateway Policy (CEGP)
 
-	// CESingularName is the singular name of Cilium Endpoint
-	CEPSingularName = "ciliumendpoint"
+	// CEGPPluralName is the plural name of Cilium Egress Gateway Policy
+	CEGPPluralName = "ciliumegressgatewaypolicies"
+
+	// CEGPKindDefinition is the kind name of Cilium Egress Gateway Policy
+	CEGPKindDefinition = "CiliumEgressGatewayPolicy"
+
+	// CEGPName is the full name of Cilium Egress Gateway Policy
+	CEGPName = CEGPPluralName + "." + CustomResourceDefinitionGroup
+
+	// Cilium Endpoint (CEP)
 
 	// CEPluralName is the plural name of Cilium Endpoint
 	CEPPluralName = "ciliumendpoints"
@@ -72,9 +64,6 @@ const (
 
 	// Cilium Node (CN)
 
-	// CNSingularName is the singular name of Cilium Node
-	CNSingularName = "ciliumnode"
-
 	// CNPluralName is the plural name of Cilium Node
 	CNPluralName = "ciliumnodes"
 
@@ -85,9 +74,6 @@ const (
 	CNName = CNPluralName + "." + CustomResourceDefinitionGroup
 
 	// Cilium Identity
-
-	// CIDSingularName is the singular name of Cilium Identity
-	CIDSingularName = "ciliumidentity"
 
 	// CIDPluralName is the plural name of Cilium Identity
 	CIDPluralName = "ciliumidentities"
@@ -100,9 +86,6 @@ const (
 
 	// Cilium Local Redirect Policy (CLRP)
 
-	// CLRPSingularName is the singular name of Local Redirect Policy
-	CLRPSingularName = "ciliumlocalredirectpolicy"
-
 	// CLRPPluralName is the plural name of Local Redirect Policy
 	CLRPPluralName = "ciliumlocalredirectpolicies"
 
@@ -114,9 +97,6 @@ const (
 
 	// Cilium External Workload (CEW)
 
-	// CEWSingularName is the singular name of Cilium External Workload
-	CEWSingularName = "ciliumexternalworkload"
-
 	// CEWPluralName is the plural name of Cilium External Workload
 	CEWPluralName = "ciliumexternalworkloads"
 
@@ -125,6 +105,28 @@ const (
 
 	// CEWName is the full name of Cilium External Workload
 	CEWName = CEWPluralName + "." + CustomResourceDefinitionGroup
+
+	// Cilium Cluster Envoy Config (CCEC)
+
+	// CCECPluralName is the plural name of Cilium Clusterwide Envoy Config
+	CCECPluralName = "ciliumclusterwideenvoyconfigs"
+
+	// CCECKindDefinition is the kind name of Cilium Clusterwide Envoy Config
+	CCECKindDefinition = "CiliumClusterwideEnvoyConfig"
+
+	// CCECName is the full name of Cilium Clusterwide Envoy Config
+	CCECName = CCECPluralName + "." + CustomResourceDefinitionGroup
+
+	// Cilium Envoy Config (CEC)
+
+	// CECPluralName is the plural name of Cilium Envoy Config
+	CECPluralName = "ciliumenvoyconfigs"
+
+	// CECKindDefinition is the kind name of Cilium Envoy Config
+	CECKindDefinition = "CiliumEnvoyConfig"
+
+	// CECName is the full name of Cilium Envoy Config
+	CECName = CECPluralName + "." + CustomResourceDefinitionGroup
 )
 
 // SchemeGroupVersion is group version used to register these objects
@@ -149,7 +151,7 @@ var (
 	//
 	//   import (
 	//     "k8s.io/client-go/kubernetes"
-	//     clientsetscheme "k8s.io/client-go/kuberentes/scheme"
+	//     clientsetscheme "k8s.io/client-go/kubernetes/scheme"
 	//     aggregatorclientsetscheme "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/scheme"
 	//   )
 	//
@@ -172,6 +174,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&CiliumNetworkPolicyList{},
 		&CiliumClusterwideNetworkPolicy{},
 		&CiliumClusterwideNetworkPolicyList{},
+		&CiliumEgressGatewayPolicy{},
+		&CiliumEgressGatewayPolicyList{},
 		&CiliumEndpoint{},
 		&CiliumEndpointList{},
 		&CiliumNode{},
@@ -182,6 +186,10 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&CiliumIdentityList{},
 		&CiliumLocalRedirectPolicy{},
 		&CiliumLocalRedirectPolicyList{},
+		&CiliumEnvoyConfig{},
+		&CiliumEnvoyConfigList{},
+		&CiliumClusterwideEnvoyConfig{},
+		&CiliumClusterwideEnvoyConfigList{},
 	)
 
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)

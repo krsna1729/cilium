@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019 Authors of Cilium
+// Copyright Authors of Cilium
 
 package logutils
 
 import (
 	"testing"
 
-	. "gopkg.in/check.v1"
+	. "github.com/cilium/checkmate"
 )
 
 // Hook up gocheck into the "go test" runner.

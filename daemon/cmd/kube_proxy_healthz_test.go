@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package cmd
 
@@ -12,9 +9,9 @@ import (
 	"net/http/httptest"
 	"time"
 
-	"github.com/cilium/cilium/api/v1/models"
+	. "github.com/cilium/checkmate"
 
-	. "gopkg.in/check.v1"
+	"github.com/cilium/cilium/api/v1/models"
 )
 
 // 'check' testing suite scaffolding.
@@ -76,7 +73,7 @@ func (s *KubeProxyHealthzTestSuite) healthTestHelper(c *C, ciliumStatus string,
 			injectedLastUpdatedTs: lastUpdateTs}}
 
 	// Create a new request.
-	req, err := http.NewRequest("GET", "/healthz", nil)
+	req, err := http.NewRequest(http.MethodGet, "/healthz", nil)
 	c.Assert(err, IsNil)
 	w := httptest.NewRecorder()
 

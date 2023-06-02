@@ -1,10 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright (C) 2020-2021 Authors of Cilium */
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Cilium */
 
 #ifndef __BPF_CTX_XDP_H_
 #define __BPF_CTX_XDP_H_
 
 #include <linux/if_ether.h>
+#include <linux/byteorder.h>
 
 #define __ctx_buff			xdp_md
 #define __ctx_is			__ctx_xdp
@@ -19,6 +20,7 @@
 #define CTX_ACT_OK			XDP_PASS
 #define CTX_ACT_DROP			XDP_DROP
 #define CTX_ACT_TX			XDP_TX	/* hairpin only */
+#define CTX_ACT_REDIRECT		XDP_REDIRECT
 
 #define CTX_DIRECT_WRITE_OK		1
 
@@ -91,7 +93,6 @@ xdp_store_bytes(const struct xdp_md *ctx, __u64 off, const void *from,
  */
 
 #define ctx_change_type			xdp_change_type__stub
-#define ctx_change_proto		xdp_change_proto__stub
 #define ctx_change_tail			xdp_change_tail__stub
 
 #define ctx_pull_data(ctx, ...)		do { /* Already linear. */ } while (0)
@@ -99,12 +100,38 @@ xdp_store_bytes(const struct xdp_md *ctx, __u64 off, const void *from,
 #define ctx_get_tunnel_key		xdp_get_tunnel_key__stub
 #define ctx_set_tunnel_key		xdp_set_tunnel_key__stub
 
+#define ctx_get_tunnel_opt		xdp_get_tunnel_opt__stub
+#define ctx_set_tunnel_opt		xdp_set_tunnel_opt__stub
+
 #define ctx_event_output		xdp_event_output
 
 #define ctx_adjust_meta			xdp_adjust_meta
 
 #define get_hash(ctx)			({ 0; })
 #define get_hash_recalc(ctx)		get_hash(ctx)
+
+#define DEFINE_FUNC_CTX_POINTER(FIELD)						\
+static __always_inline void *							\
+ctx_ ## FIELD(const struct xdp_md *ctx)						\
+{										\
+	void *ptr;								\
+										\
+	/* LLVM may generate u32 assignments of ctx->{data,data_end,data_meta}.	\
+	 * With this inline asm, LLVM loses track of the fact this field is on	\
+	 * 32 bits.								\
+	 */									\
+	asm volatile("%0 = *(u32 *)(%1 + %2)"					\
+		     : "=r"(ptr)						\
+		     : "r"(ctx), "i"(offsetof(struct xdp_md, FIELD)));		\
+	return ptr;								\
+}
+/* This defines ctx_data(). */
+DEFINE_FUNC_CTX_POINTER(data)
+/* This defines ctx_data_end(). */
+DEFINE_FUNC_CTX_POINTER(data_end)
+/* This defines ctx_data_meta(). */
+DEFINE_FUNC_CTX_POINTER(data_meta)
+#undef DEFINE_FUNC_CTX_POINTER
 
 static __always_inline __maybe_unused void
 __csum_replace_by_diff(__sum16 *sum, __wsum diff)
@@ -195,6 +222,44 @@ l4_csum_replace(const struct xdp_md *ctx, __u64 off, __u32 from, __u32 to,
 }
 
 static __always_inline __maybe_unused int
+ctx_change_proto(struct xdp_md *ctx __maybe_unused,
+		 const __be16 proto __maybe_unused,
+		 const __u64 flags __maybe_unused)
+{
+	const __s32 len_diff = proto == __constant_htons(ETH_P_IPV6) ?
+			       20 /* 4->6 */ : -20 /* 6->4 */;
+	const __u32 move_len = 14;
+	void *data, *data_end;
+	int ret;
+
+	/* We make the assumption that when ctx_change_proto() is called
+	 * the target proto != current proto.
+	 */
+	build_bug_on(flags != 0);
+	build_bug_on(proto != __constant_htons(ETH_P_IPV6) &&
+		     proto != __constant_htons(ETH_P_IP));
+
+	if (len_diff < 0) {
+		data_end = ctx_data_end(ctx);
+		data = ctx_data(ctx);
+		if (data + move_len + -len_diff <= data_end)
+			__bpf_memmove_fwd(data + -len_diff, data, move_len);
+		else
+			return -EFAULT;
+	}
+	ret = xdp_adjust_head(ctx, -len_diff);
+	if (!ret && len_diff > 0) {
+		data_end = ctx_data_end(ctx);
+		data = ctx_data(ctx);
+		if (data + move_len + len_diff <= data_end)
+			__bpf_memmove_fwd(data, data + len_diff, move_len);
+		else
+			return -EFAULT;
+	}
+	return ret;
+}
+
+static __always_inline __maybe_unused int
 ctx_adjust_troom(struct xdp_md *ctx, const __s32 len_diff)
 {
 	return xdp_adjust_tail(ctx, len_diff);
@@ -209,7 +274,8 @@ ctx_adjust_hroom(struct xdp_md *ctx, const __s32 len_diff, const __u32 mode,
 	void *data, *data_end;
 	int ret;
 
-	build_bug_on(len_diff <= 0 || len_diff >= 64);
+	/* Note: when bumping len_diff, consider headroom on popular NICs. */
+	build_bug_on(len_diff <= 0 || len_diff >= 128);
 	build_bug_on(mode != BPF_ADJ_ROOM_NET);
 
 	ret = xdp_adjust_head(ctx, -len_diff);
@@ -231,6 +297,10 @@ ctx_adjust_hroom(struct xdp_md *ctx, const __s32 len_diff, const __u32 mode,
 						  move_len_v4);
 			else
 				ret = -EFAULT;
+			break;
+		case 50: /* struct {ethhdr + iphdr + udphdr + genevehdr / vxlanhdr} */
+		case 50 + 12: /* geneve with IPv4 DSR option */
+		case 50 + 24: /* geneve with IPv6 DSR option */
 			break;
 		case 48: /* struct {ipv6hdr + icmp6hdr} */
 			break;
@@ -258,11 +328,31 @@ ctx_redirect(const struct xdp_md *ctx, int ifindex, const __u32 flags)
 	return redirect(ifindex, flags);
 }
 
+static __always_inline __maybe_unused int
+ctx_redirect_peer(const struct xdp_md *ctx __maybe_unused,
+		  int ifindex __maybe_unused,
+		  const __u32 flags __maybe_unused)
+{
+	/* bpf_redirect_peer() is available only in TC BPF. */
+	return -ENOTSUP;
+}
+
 static __always_inline __maybe_unused __u64
 ctx_full_len(const struct xdp_md *ctx)
 {
-	/* No non-linear section in XDP. */
-	return ctx_data_end(ctx) - ctx_data(ctx);
+	__u64 len;
+	/* Compute the length using inline assembly as clang
+	 * sometimes reorganizes expressions involving this,
+	 * which leads to "pointer arithmetic on pkt_end prohibited"
+	 */
+	asm volatile("r1 = *(u32 *)(%[ctx] +0)\n\t"
+		     "r2 = *(u32 *)(%[ctx] +4)\n\t"
+		     "%[len] = r2\n\t"
+		     "%[len] -= r1\n\t"
+		     : [len]"=r"(len)
+		     : [ctx]"r"(ctx)
+		     : "r1", "r2");
+	return len;
 }
 
 static __always_inline __maybe_unused __u32
@@ -273,7 +363,7 @@ ctx_wire_len(const struct xdp_md *ctx)
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__type(key, int);
+	__uint(key_size, sizeof(int));
 	__uint(value_size, META_PIVOT);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__uint(max_entries, 1);
@@ -300,7 +390,7 @@ ctx_load_meta(const struct xdp_md *ctx __maybe_unused, const __u64 off)
 	return 0;
 }
 
-static __always_inline __maybe_unused __u32
+static __always_inline __maybe_unused __u16
 ctx_get_protocol(const struct xdp_md *ctx)
 {
 	void *data_end = ctx_data_end(ctx);
@@ -317,5 +407,4 @@ ctx_get_ifindex(const struct xdp_md *ctx)
 {
 	return ctx->ingress_ifindex;
 }
-
 #endif /* __BPF_CTX_XDP_H_ */

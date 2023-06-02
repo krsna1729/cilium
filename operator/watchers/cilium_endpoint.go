@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package watchers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"sync"
 
-	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
-	cilium_cli "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/typed/cilium.io/v2"
-	"github.com/cilium/cilium/pkg/k8s/informer"
-
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/tools/cache"
+
+	ces "github.com/cilium/cilium/operator/pkg/ciliumendpointslice"
+	"github.com/cilium/cilium/pkg/k8s"
+	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
+	"github.com/cilium/cilium/pkg/k8s/informer"
+	"github.com/cilium/cilium/pkg/k8s/utils"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 const identityIndex = "identity"
@@ -39,7 +43,19 @@ var (
 	CiliumEndpointsSynced = make(chan struct{})
 	// once is used to make sure CiliumEndpointsInit is only setup once.
 	once sync.Once
+
+	// cesController watches for CiliumEndpoint changes, and accordingly updates CiliumEndpointSlices
+	// CiliumEndpoint watcher notifies the cesController, if any CiliumEndpoint is Added
+	// Updated or Deleted.
+	cesController *ces.CiliumEndpointSliceController
 )
+
+// CiliumEndpointsSliceInit starts a CiliumEndpointWatcher and caches cesController locally.
+func CiliumEndpointsSliceInit(ctx context.Context, wg *sync.WaitGroup, clientset k8sClient.Clientset,
+	cbController *ces.CiliumEndpointSliceController) {
+	cesController = cbController
+	CiliumEndpointsInit(ctx, wg, clientset)
+}
 
 // identityIndexFunc index identities by ID.
 func identityIndexFunc(obj interface{}) ([]string, error) {
@@ -55,22 +71,54 @@ func identityIndexFunc(obj interface{}) ([]string, error) {
 }
 
 // CiliumEndpointsInit starts a CiliumEndpointWatcher
-func CiliumEndpointsInit(ciliumNPClient cilium_cli.CiliumV2Interface, stopCh <-chan struct{}) {
+func CiliumEndpointsInit(ctx context.Context, wg *sync.WaitGroup, clientset k8sClient.Clientset) {
 	once.Do(func() {
 		CiliumEndpointStore = cache.NewIndexer(cache.DeletionHandlingMetaNamespaceKeyFunc, indexers)
 
+		var cacheResourceHandler cache.ResourceEventHandlerFuncs
+
+		// Register notification function only if CES feature is enabled.
+		if option.Config.EnableCiliumEndpointSlice {
+			cacheResourceHandler = cache.ResourceEventHandlerFuncs{
+				AddFunc: func(obj interface{}) {
+					if cep := objToCiliumEndpoint(obj); cep != nil {
+						endpointUpdated(cep)
+					}
+				},
+				UpdateFunc: func(oldObj, newObj interface{}) {
+					if oldCEP := objToCiliumEndpoint(oldObj); oldCEP != nil {
+						if newCEP := objToCiliumEndpoint(newObj); newCEP != nil {
+							if oldCEP.DeepEqual(newCEP) {
+								return
+							}
+							endpointUpdated(newCEP)
+						}
+					}
+				},
+				DeleteFunc: func(obj interface{}) {
+					if cep := objToCiliumEndpoint(obj); cep != nil {
+						endpointDeleted(cep)
+					}
+				},
+			}
+		}
+
 		ciliumEndpointInformer := informer.NewInformerWithStore(
-			cache.NewListWatchFromClient(ciliumNPClient.RESTClient(),
-				cilium_api_v2.CEPPluralName, v1.NamespaceAll, fields.Everything()),
+			utils.ListerWatcherFromTyped[*cilium_api_v2.CiliumEndpointList](clientset.CiliumV2().CiliumEndpoints("")),
 			&cilium_api_v2.CiliumEndpoint{},
 			0,
-			cache.ResourceEventHandlerFuncs{},
+			cacheResourceHandler,
 			convertToCiliumEndpoint,
 			CiliumEndpointStore,
 		)
-		go ciliumEndpointInformer.Run(stopCh)
 
-		cache.WaitForCacheSync(stopCh, ciliumEndpointInformer.HasSynced)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ciliumEndpointInformer.Run(ctx.Done())
+		}()
+
+		cache.WaitForCacheSync(ctx.Done(), ciliumEndpointInformer.HasSynced)
 		close(CiliumEndpointsSynced)
 	})
 }
@@ -89,9 +137,13 @@ func convertToCiliumEndpoint(obj interface{}) interface{} {
 				Namespace:       concreteObj.Namespace,
 				ResourceVersion: concreteObj.ResourceVersion,
 				OwnerReferences: concreteObj.OwnerReferences,
+				UID:             concreteObj.UID,
 			},
 			Status: cilium_api_v2.EndpointStatus{
-				Identity: concreteObj.Status.Identity,
+				Identity:   concreteObj.Status.Identity,
+				Networking: concreteObj.Status.Networking,
+				NamedPorts: concreteObj.Status.NamedPorts,
+				Encryption: concreteObj.Status.Encryption,
 			},
 		}
 		*concreteObj = cilium_api_v2.CiliumEndpoint{}
@@ -110,9 +162,13 @@ func convertToCiliumEndpoint(obj interface{}) interface{} {
 					Namespace:       ciliumEndpoint.Namespace,
 					ResourceVersion: ciliumEndpoint.ResourceVersion,
 					OwnerReferences: ciliumEndpoint.OwnerReferences,
+					UID:             ciliumEndpoint.UID,
 				},
 				Status: cilium_api_v2.EndpointStatus{
-					Identity: ciliumEndpoint.Status.Identity,
+					Identity:   ciliumEndpoint.Status.Identity,
+					Networking: ciliumEndpoint.Status.Networking,
+					NamedPorts: ciliumEndpoint.Status.NamedPorts,
+					Encryption: ciliumEndpoint.Status.Encryption,
 				},
 			},
 		}
@@ -151,4 +207,37 @@ func HasCE(ns, name string) (*cilium_api_v2.CiliumEndpoint, bool, error) {
 	}
 	cep := item.(*cilium_api_v2.CiliumEndpoint)
 	return cep, exists, nil
+}
+
+func endpointUpdated(cep *cilium_api_v2.CiliumEndpoint) {
+	if cep.Status.Networking == nil || cep.Status.Identity == nil || cep.GetName() == "" || cep.Namespace == "" {
+		return
+	}
+	cesController.Manager.InsertCEPInCache(k8s.ConvertCEPToCoreCEP(cep), cep.Namespace)
+}
+
+func endpointDeleted(cep *cilium_api_v2.CiliumEndpoint) {
+	cesController.Manager.RemoveCEPFromCache(ces.GetCEPNameFromCCEP(k8s.ConvertCEPToCoreCEP(cep), cep.Namespace), ces.DefaultCESSyncTime)
+}
+
+// objToCiliumEndpoint attempts to cast object to a CiliumEndpoint object
+// and returns a deep copy if the cast succeeds. Otherwise, nil is returned.
+func objToCiliumEndpoint(obj interface{}) *cilium_api_v2.CiliumEndpoint {
+	cep, ok := obj.(*cilium_api_v2.CiliumEndpoint)
+	if ok {
+		return cep
+	}
+	deletedObj, ok := obj.(cache.DeletedFinalStateUnknown)
+	if ok {
+		// Delete was not observed by the watcher but is
+		// removed from kube-apiserver. This is the last
+		// known state and the object no longer exists.
+		cep, ok := deletedObj.Obj.(*cilium_api_v2.CiliumEndpoint)
+		if ok {
+			return cep
+		}
+	}
+	log.WithField(logfields.Object, logfields.Repr(obj)).
+		Warn("Ignoring invalid v2 CiliumEndpoint")
+	return cep
 }

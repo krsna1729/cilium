@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2020 Authors of Cilium
+// Copyright Authors of Cilium
+
 // Copyright 2017 Lyft, Inc.
 
 package eni
@@ -8,21 +9,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"sort"
 	"strings"
 	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/smithy-go"
-	"github.com/cilium/cilium/operator/option"
+	"github.com/sirupsen/logrus"
+
+	operatorOption "github.com/cilium/cilium/operator/option"
 	"github.com/cilium/cilium/pkg/aws/eni/limits"
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	"github.com/cilium/cilium/pkg/defaults"
+	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipam"
+	"github.com/cilium/cilium/pkg/ipam/option"
+	"github.com/cilium/cilium/pkg/ipam/stats"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/math"
-
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -33,11 +41,19 @@ const (
 		" this could lead to ip allocation overflows if the max-allocate flag is not set"
 )
 
+type ipamNodeActions interface {
+	IsPrefixDelegationEnabled() bool
+	InstanceID() string
+	Ops() ipam.NodeOperations
+	SetRunning(bool)
+	UpdatedResource(*v2.CiliumNode) bool
+}
+
 // Node represents a Kubernetes node running Cilium with an associated
 // CiliumNode custom resource
 type Node struct {
 	// node contains the general purpose fields of a node
-	node *ipam.Node
+	node ipamNodeActions
 
 	// mutex protects members below this field
 	mutex lock.RWMutex
@@ -119,9 +135,22 @@ func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *logrus.Entry) *ipam.Re
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 
+	// Needed for selecting the same ENI to release IPs from
+	// when more than one ENI qualifies for release
+	eniIds := make([]string, 0, len(n.enis))
+	for k := range n.enis {
+		eniIds = append(eniIds, k)
+	}
+	sort.Strings(eniIds)
 	// Iterate over ENIs on this node, select the ENI with the most
 	// addresses available for release
-	for key, e := range n.enis {
+	for _, eniId := range eniIds {
+		e := n.enis[eniId]
+
+		// IP release for prefixes is not currently supported. Will skip releasing from this ENI
+		if len(e.Prefixes) > 0 {
+			continue
+		}
 		scopedLog.WithFields(logrus.Fields{
 			fieldEniID:     e.ID,
 			"needIndex":    *n.k8sObj.Spec.ENI.FirstInterfaceIndex,
@@ -129,7 +158,7 @@ func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *logrus.Entry) *ipam.Re
 			"numAddresses": len(e.Addresses),
 		}).Debug("Considering ENI for IP release")
 
-		if e.Number < *n.k8sObj.Spec.ENI.FirstInterfaceIndex {
+		if e.IsExcludedBySpec(n.k8sObj.Spec.ENI) {
 			continue
 		}
 
@@ -160,7 +189,7 @@ func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *logrus.Entry) *ipam.Re
 		eniWithMoreFreeIPsFound := maxReleaseOnENI > len(r.IPsToRelease)
 		// Select the ENI with the most addresses available for release
 		if firstENIWithFreeIPFound || eniWithMoreFreeIPsFound {
-			r.InterfaceID = key
+			r.InterfaceID = eniId
 			r.PoolID = ipamTypes.PoolID(e.Subnet.ID)
 			r.IPsToRelease = freeIpsOnENI[:maxReleaseOnENI]
 		}
@@ -179,7 +208,7 @@ func (n *Node) ReleaseIPs(ctx context.Context, r *ipam.ReleaseAction) error {
 func (n *Node) PrepareIPAllocation(scopedLog *logrus.Entry) (a *ipam.AllocationAction, err error) {
 	limits, limitsAvailable := n.getLimits()
 	if !limitsAvailable {
-		return nil, fmt.Errorf("Unable to determine limits")
+		return nil, fmt.Errorf(errUnableToDetermineLimits)
 	}
 
 	a = &ipam.AllocationAction{}
@@ -196,17 +225,17 @@ func (n *Node) PrepareIPAllocation(scopedLog *logrus.Entry) (a *ipam.AllocationA
 			"numAddresses": len(e.Addresses),
 		}).Debug("Considering ENI for allocation")
 
-		if e.Number < *n.k8sObj.Spec.ENI.FirstInterfaceIndex {
+		if e.IsExcludedBySpec(n.k8sObj.Spec.ENI) {
+			scopedLog.WithField(fieldEniID, e.ID).Debug("ENI is excluded by spec")
 			continue
 		}
 
-		// The limits include the primary IP, so we need to take it into account
-		// when computing the amount of available addresses on the ENI.
-		availableOnENI := math.IntMax(limits.IPv4-len(e.Addresses)-1, 0)
+		_, effectiveLimits := n.getEffectiveIPLimits(&e, limits.IPv4)
+		availableOnENI := math.IntMax(effectiveLimits-len(e.Addresses), 0)
 		if availableOnENI <= 0 {
 			continue
 		} else {
-			a.AvailableInterfaces++
+			a.InterfaceCandidates++
 		}
 
 		scopedLog.WithFields(logrus.Fields{
@@ -227,13 +256,45 @@ func (n *Node) PrepareIPAllocation(scopedLog *logrus.Entry) (a *ipam.AllocationA
 			}
 		}
 	}
-	a.AvailableInterfaces = limits.Adapters - len(n.enis) + a.AvailableInterfaces
+	a.EmptyInterfaceSlots = limits.Adapters - len(n.enis)
 
 	return
 }
 
+// isSubnetAtCapacity parses error from AWS SDK to understand if the subnet is out of capacity either due to out of
+// prefixes or IPs
+func isSubnetAtCapacity(err error) bool {
+	var apiErr smithy.APIError
+	errorStr := "There aren't sufficient free Ipv4 addresses or prefixes"
+	if errors.As(err, &apiErr) {
+		// Unfortunately SDK v1 has better error handling than v2. AWS VPC CNI plugin still uses v1 and relies on error
+		// codes like PrivateIpAddressLimitExceeded.
+		// See https://github.com/aws/amazon-vpc-cni-k8s/blob/fd8bcf0be4b522d13fb69c18539921452e4dec80/pkg/awsutils/awsutils.go#L1477-L1487 for more details.
+		// Cilium uses v2 SDK, so we need to rely on string comparison until the SDK supports custom errors.
+		return apiErr.ErrorCode() == "InvalidParameterValue" && strings.Contains(apiErr.ErrorMessage(), errorStr)
+	}
+	return false
+}
+
 // AllocateIPs performs the ENI allocation oepration
 func (n *Node) AllocateIPs(ctx context.Context, a *ipam.AllocationAction) error {
+	// Check if the interface to allocate on is prefix delegated
+	n.mutex.RLock()
+	isPrefixDelegated := n.node.Ops().IsPrefixDelegated()
+	n.mutex.RUnlock()
+
+	if isPrefixDelegated {
+		numPrefixes := ip.PrefixCeil(a.AvailableForAllocation, option.ENIPDBlockSizeIPv4)
+		err := n.manager.api.AssignENIPrefixes(ctx, a.InterfaceID, int32(numPrefixes))
+		if !isSubnetAtCapacity(err) {
+			return err
+		}
+		// Subnet might be out of available /28 prefixes, but /32 IP addresses might be available.
+		// We should attempt to allocate /32 IPs.
+		n.loggerLocked().WithFields(logrus.Fields{
+			logfields.Node: n.k8sObj.Name,
+		}).Warning("Subnet might be out of prefixes, Cilium will not allocate prefixes on this node anymore")
+	}
 	return n.manager.api.AssignPrivateIpAddresses(ctx, a.InterfaceID, int32(a.AvailableForAllocation))
 }
 
@@ -329,12 +390,16 @@ func (n *Node) findNextIndex(index int32) int32 {
 // CreateInterface without additional context embedded in order to make them
 // usable for metrics accounting purposes.
 const (
-	errUnableToDetermineLimits    = "unable to determine limits"
-	errUnableToGetSecurityGroups  = "unable to get security groups"
-	errUnableToCreateENI          = "unable to create ENI"
-	errUnableToAttachENI          = "unable to attach ENI"
-	errUnableToMarkENIForDeletion = "unable to mark ENI for deletion"
-	errUnableToFindSubnet         = "unable to find matching subnet"
+	errUnableToDetermineLimits   = "unable to determine limits"
+	unableToDetermineLimits      = "unableToDetermineLimits"
+	errUnableToGetSecurityGroups = "unable to get security groups"
+	unableToGetSecurityGroups    = "unableToGetSecurityGroups"
+	errUnableToCreateENI         = "unable to create ENI"
+	unableToCreateENI            = "unableToCreateENI"
+	errUnableToAttachENI         = "unable to attach ENI"
+	unableToAttachENI            = "unableToAttachENI"
+	unableToMarkENIForDeletion   = "unableToMarkENIForDeletion"
+	unableToFindSubnet           = "unableToFindSubnet"
 )
 
 // CreateInterface creates an additional interface with the instance and
@@ -344,23 +409,18 @@ const (
 func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationAction, scopedLog *logrus.Entry) (int, string, error) {
 	limits, limitsAvailable := n.getLimits()
 	if !limitsAvailable {
-		return 0, errUnableToDetermineLimits, fmt.Errorf(errUnableToDetermineLimits)
+		return 0, unableToDetermineLimits, fmt.Errorf(errUnableToDetermineLimits)
 	}
 
 	n.mutex.RLock()
 	resource := *n.k8sObj
+	isPrefixDelegated := n.node.Ops().IsPrefixDelegated()
 	n.mutex.RUnlock()
 
-	var bestSubnet *ipamTypes.Subnet
-	if len(resource.Spec.ENI.SubnetIDs) > 0 {
-		bestSubnet = n.manager.FindSubnetByIDs(resource.Spec.ENI.VpcID, resource.Spec.ENI.AvailabilityZone, resource.Spec.ENI.SubnetIDs)
-	} else {
-		bestSubnet = n.manager.FindSubnetByTags(resource.Spec.ENI.VpcID, resource.Spec.ENI.AvailabilityZone, resource.Spec.ENI.SubnetTags)
-	}
-
-	if bestSubnet == nil {
+	subnet := n.findSuitableSubnet(resource.Spec.ENI, limits)
+	if subnet == nil {
 		return 0,
-			errUnableToFindSubnet,
+			unableToFindSubnet,
 			fmt.Errorf(
 				"No matching subnet available for interface creation (VPC=%s AZ=%s SubnetIDs=%v SubnetTags=%s)",
 				resource.Spec.ENI.VpcID,
@@ -369,11 +429,12 @@ func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationA
 				resource.Spec.ENI.SubnetTags,
 			)
 	}
+	allocation.PoolID = ipamTypes.PoolID(subnet.ID)
 
 	securityGroupIDs, err := n.getSecurityGroupIDs(ctx, resource.Spec.ENI)
 	if err != nil {
 		return 0,
-			errUnableToGetSecurityGroups,
+			unableToGetSecurityGroups,
 			fmt.Errorf("%s %s", errUnableToGetSecurityGroups, err)
 	}
 
@@ -389,19 +450,32 @@ func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationA
 	index := n.findNextIndex(int32(*resource.Spec.ENI.FirstInterfaceIndex))
 
 	scopedLog = scopedLog.WithFields(logrus.Fields{
-		"securityGroupIDs": securityGroupIDs,
-		"subnetID":         bestSubnet.ID,
-		"addresses":        toAllocate,
+		"securityGroupIDs":  securityGroupIDs,
+		"subnetID":          subnet.ID,
+		"addresses":         toAllocate,
+		"isPrefixDelegated": isPrefixDelegated,
 	})
 	scopedLog.Info("No more IPs available, creating new ENI")
 
-	eniID, eni, err := n.manager.api.CreateNetworkInterface(ctx, int32(toAllocate), bestSubnet.ID, desc, securityGroupIDs)
+	eniID, eni, err := n.manager.api.CreateNetworkInterface(ctx, int32(toAllocate), subnet.ID, desc, securityGroupIDs, isPrefixDelegated)
 	if err != nil {
-		return 0, errUnableToCreateENI, fmt.Errorf("%s %s", errUnableToCreateENI, err)
+		if isPrefixDelegated && isSubnetAtCapacity(err) {
+			// Subnet might be out of available /28 prefixes, but /32 IP addresses might be available.
+			// We should attempt to allocate /32 IPs.
+			scopedLog.WithField(logfields.Node, n.k8sObj.Name).Warning("Subnet might be out of prefixes, Cilium will not allocate prefixes on this node anymore")
+			eniID, eni, err = n.manager.api.CreateNetworkInterface(ctx, int32(toAllocate), subnet.ID, desc, securityGroupIDs, false)
+		}
+		if err != nil {
+			return 0, unableToCreateENI, fmt.Errorf("%s %s", errUnableToCreateENI, err)
+		}
 	}
 
 	scopedLog = scopedLog.WithField(fieldEniID, eniID)
 	scopedLog.Info("Created new ENI")
+
+	if subnet.CIDR != nil {
+		eni.Subnet.CIDR = subnet.CIDR.String()
+	}
 
 	var attachmentID string
 	for attachRetries := 0; attachRetries < maxAttachRetries; attachRetries++ {
@@ -428,7 +502,7 @@ func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationA
 		}
 
 		return 0,
-			errUnableToAttachENI,
+			unableToAttachENI,
 			fmt.Errorf("%s at index %d: %s", errUnableToAttachENI, index, err)
 	}
 
@@ -455,7 +529,7 @@ func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationA
 				return toAllocate, "", nil
 			}
 
-			return 0, errUnableToMarkENIForDeletion, fmt.Errorf("unable to mark ENI for deletion on termination: %s", err)
+			return 0, unableToMarkENIForDeletion, fmt.Errorf("unable to mark ENI for deletion on termination: %s", err)
 		}
 	}
 
@@ -466,14 +540,35 @@ func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationA
 
 // ResyncInterfacesAndIPs is called to retrieve and ENIs and IPs as known to
 // the EC2 API and return them
-func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *logrus.Entry) (ipamTypes.AllocationMap, error) {
+func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *logrus.Entry) (
+	available ipamTypes.AllocationMap,
+	stats stats.InterfaceStats,
+	err error) {
+	limits, limitsAvailable := n.getLimits()
+	if !limitsAvailable {
+		return nil, stats, fmt.Errorf(errUnableToDetermineLimits)
+	}
+
 	// n.node does not need to be protected by n.mutex as it is only written to
 	// upon creation of `n`
 	instanceID := n.node.InstanceID()
-	available := ipamTypes.AllocationMap{}
+	available = ipamTypes.AllocationMap{}
 
 	n.mutex.Lock()
 	n.enis = map[string]eniTypes.ENI{}
+
+	// 1. This calculates the base interface effective limit on this Node, given:
+	// 		* IPAM Prefix Delegation
+	// 		* Node Spec usePrimaryAddress being enabled
+	//
+	_, stats.NodeCapacity = n.getEffectiveIPLimits(nil, limits.IPv4)
+
+	// 2. The base node limit is the number of adapters multiplied by the instances IP limit.
+	//
+	// Note: This may be modified in step(s) 3, where:
+	// * Any leftover additional prefix delegated room will be added to this total.
+	// * Any excluded interfaces will be subtracted from this total.
+	stats.NodeCapacity *= limits.Adapters
 
 	n.manager.ForeachInstance(instanceID,
 		func(instanceID, interfaceID string, rev ipamTypes.InterfaceRevision) error {
@@ -483,10 +578,22 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *logrus.Ent
 			}
 
 			n.enis[e.ID] = *e
-			index := *n.k8sObj.Spec.ENI.FirstInterfaceIndex
 
-			if e.Number < index {
+			// 3. Finally, we iterate any already existing interfaces and add on any extra
+			//		capacity to account for leftover prefix delegated /28 ip slots.
+			leftoverPrefixCapcity, effectiveLimits := n.getEffectiveIPLimits(e, limits.IPv4)
+			if e.IsExcludedBySpec(n.k8sObj.Spec.ENI) {
+				// If this ENI is excluded by the CN Spec, we remove it from the total
+				// capacity.
+				stats.NodeCapacity -= effectiveLimits
 				return nil
+			} else {
+				stats.NodeCapacity += leftoverPrefixCapcity
+			}
+
+			availableOnENI := math.IntMax(effectiveLimits-len(e.Addresses), 0)
+			if availableOnENI > 0 {
+				stats.RemainingAvailableInterfaceCount++
 			}
 
 			for _, ip := range e.Addresses {
@@ -500,10 +607,11 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *logrus.Ent
 	// An ec2 instance has at least one ENI attached, no ENI found implies instance not found.
 	if enis == 0 {
 		scopedLog.Warning("Instance not found! Please delete corresponding ciliumnode if instance has already been deleted.")
-		return nil, fmt.Errorf("unable to retrieve ENIs")
+		return nil, stats, fmt.Errorf("unable to retrieve ENIs")
 	}
 
-	return available, nil
+	stats.RemainingAvailableInterfaceCount += limits.Adapters - len(n.enis)
+	return available, stats, nil
 }
 
 // GetMaximumAllocatableIPv4 returns the maximum amount of IPv4 addresses
@@ -552,6 +660,10 @@ func (n *Node) GetMaximumAllocatableIPv4() int {
 	// limits.IPv4 contains the primary IP which is not available for allocation
 	maxPerInterface := math.IntMax(limits.IPv4-1, 0)
 
+	if n.IsPrefixDelegated() {
+		maxPerInterface = maxPerInterface * option.ENIPDBlockSizeIPv4
+	}
+
 	// Return the maximum amount of IP addresses allocatable on the instance
 	return (limits.Adapters - firstInterfaceIndex) * maxPerInterface
 }
@@ -592,7 +704,7 @@ func (n *Node) GetMinimumAllocatableIPv4() int {
 				"instance-type": n.k8sObj.Spec.ENI.InstanceType,
 			}).Warningf(
 				"Unable to find limits for instance type, consider setting --%s=true on the Operator",
-				option.UpdateEC2AdapterLimitViaAPI,
+				operatorOption.UpdateEC2AdapterLimitViaAPI,
 			)
 		})
 
@@ -614,4 +726,145 @@ func (n *Node) GetMinimumAllocatableIPv4() int {
 	maxPerInterface := math.IntMax(limits.IPv4-1, 0)
 
 	return math.IntMin(minimum, (limits.Adapters-index)*maxPerInterface)
+}
+
+func (n *Node) isPrefixDelegationEnabled() bool {
+	if n.node == nil {
+		return false
+	}
+	return n.node.IsPrefixDelegationEnabled()
+}
+
+// IsPrefixDelegated indicates whether prefix delegation can be enabled on a node.
+// Currently, mixed usage of secondary IPs and prefixes is not supported. n.mutex
+// read lock must be held before calling this method.
+func (n *Node) IsPrefixDelegated() bool {
+	if !n.isPrefixDelegationEnabled() {
+		return false
+	}
+	// Verify if this node is nitro based
+	limits, limitsAvailable := n.getLimitsLocked()
+	if !limitsAvailable {
+		return false
+	}
+	// Allocating prefixes is supported only on nitro instances
+	if limits.HypervisorType != "nitro" {
+		return false
+	}
+	// Check if this node is allowed to use prefix delegation
+	if n.k8sObj.Spec.ENI.DisablePrefixDelegation != nil && aws.ToBool(n.k8sObj.Spec.ENI.DisablePrefixDelegation) {
+		return false
+	}
+	// Verify if all interfaces are prefix delegated. We don't want to enable prefix delegation on nodes that already
+	// use secondary IPs.
+	for _, eni := range n.enis {
+		if len(eni.Addresses) == 0 {
+			continue
+		}
+		if len(eni.Prefixes) == 0 && len(eni.Addresses) > 0 {
+			// Ignore primary IP of the ENI
+			if len(eni.Addresses) == 1 && eni.Addresses[0] == eni.IP {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// GetUsedIPWithPrefixes returns the total number of used IPs on the node including the prefixes allocated.
+// A prefix is considered as used if there is at least one allocated IP from that prefix. All IPs from a used prefix
+// are included in the count returned.
+func (n *Node) GetUsedIPWithPrefixes() int {
+	var usedIps int
+	eniPrefixes := make(map[string][]*net.IPNet)
+
+	// Populate ENI -> Prefix mapping
+	for eniName, eni := range n.k8sObj.Status.ENI.ENIs {
+		var prefixes []*net.IPNet
+		for _, pfx := range eni.Prefixes {
+			_, ipNet, err := net.ParseCIDR(pfx)
+			if err != nil {
+				continue
+			}
+			prefixes = append(prefixes, ipNet)
+		}
+		eniPrefixes[eniName] = prefixes
+	}
+	usedPfx := make(map[string]bool)
+	for ip, resource := range n.k8sObj.Status.IPAM.Used {
+		// Fetch prefixes on this IP's ENI
+		prefixNetworks, exists := eniPrefixes[resource.Resource]
+		if !exists {
+			continue
+		}
+		var prefixBased bool
+		var pfx string
+		// Check if the IP is from any of the prefixes attached to this ENI
+		for _, ipNet := range prefixNetworks {
+			if ipNet.Contains(net.ParseIP(ip)) {
+				prefixBased = true
+				pfx = ipNet.String()
+				break
+			}
+		}
+		if prefixBased {
+			if !usedPfx[pfx] {
+				usedIps = usedIps + option.ENIPDBlockSizeIPv4
+				usedPfx[pfx] = true
+			}
+		} else {
+			usedIps++
+		}
+	}
+	return usedIps
+}
+
+// getEffectiveIPLimits computing the effective number of available addresses on the ENI
+// based on limits (which includes any left over prefix delegation capacity), as well as
+// just the left over prefix delegation capacity.
+func (n *Node) getEffectiveIPLimits(eni *eniTypes.ENI, limits int) (leftoverPrefixCapacity, effectiveLimits int) {
+	// The limits include the primary IP, so we need to take it into account
+	// when computing the effective number of available addresses on the ENI.
+	effectiveLimits = limits - 1
+
+	// Include the primary IP when UsePrimaryAddress is set to true on ENI spec.
+	if n.k8sObj.Spec.ENI.UsePrimaryAddress != nil && *n.k8sObj.Spec.ENI.UsePrimaryAddress {
+		effectiveLimits++
+	}
+
+	if n.IsPrefixDelegated() {
+		effectiveLimits = effectiveLimits * option.ENIPDBlockSizeIPv4
+	} else if eni != nil && len(eni.Prefixes) > 0 {
+		// If prefix delegation was previously enabled on this node, account for IPs from prefixes
+		leftoverPrefixCapacity = len(eni.Prefixes) * (option.ENIPDBlockSizeIPv4 - 1)
+		effectiveLimits += leftoverPrefixCapacity
+	}
+	return leftoverPrefixCapacity, effectiveLimits
+}
+
+// findSuitableSubnet attempts to find a subnet to allocate an ENI in according to the following heuristic.
+//  0. In general, the subnet has to be in the same VPC and match the availability zone of the
+//     node. If there are multiple candidates, we choose the subnet with the most addresses
+//     available.
+//  1. If we have explicit ID or tag constraints, chose a matching subnet. ID constraints take
+//     precedence.
+//  2. If we have no explicit constraints, try to use the subnet the first ENI of the node was
+//     created in, to avoid putting the ENI in a surprising subnet if possible.
+//  3. If none of these work, fall back to just choosing the subnet with the most addresses
+//     available.
+func (n *Node) findSuitableSubnet(spec eniTypes.ENISpec, limits ipamTypes.Limits) *ipamTypes.Subnet {
+	var subnet *ipamTypes.Subnet
+	if len(spec.SubnetIDs) > 0 {
+		return n.manager.FindSubnetByIDs(spec.VpcID, spec.AvailabilityZone, spec.SubnetIDs)
+	} else if len(spec.SubnetTags) > 0 {
+		return n.manager.FindSubnetByTags(spec.VpcID, spec.AvailabilityZone, spec.SubnetTags)
+	}
+
+	subnet = n.manager.GetSubnet(spec.NodeSubnetID)
+	if subnet != nil && subnet.AvailableAddresses >= limits.IPv4 {
+		return subnet
+	}
+
+	return n.manager.FindSubnetByTags(spec.VpcID, spec.AvailabilityZone, nil)
 }

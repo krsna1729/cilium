@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019 Authors of Hubble
+// Copyright Authors of Hubble
 
 syntax = "proto3";
 
 import "google/protobuf/wrappers.proto";
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/field_mask.proto";
 import public "flow/flow.proto";
 import "relay/relay.proto";
 
@@ -70,7 +71,13 @@ message ServerStatusResponse {
 
 message GetFlowsRequest {
     // Number of flows that should be returned. Incompatible with `since/until`.
+    // Defaults to the most recent (last) `number` flows, unless `first` is
+    // true, then it will return the earliest `number` flows.
     uint64 number = 1;
+
+    // first specifies if we should look at the first `number` flows or the
+    // last `number` of flows. Incompatible with `follow`.
+    bool first = 9;
 
     reserved 2; // removed, do not use
 
@@ -99,6 +106,16 @@ message GetFlowsRequest {
 
     // Until this time for returned flows. Incompatible with `number`.
     google.protobuf.Timestamp until = 8;
+
+    // Experimental contains fields that are not stable yet. Support for
+    // experimental features is always optional and subject to change.
+    message Experimental {
+        // FieldMask allows clients to limit flow's fields that will be returned.
+        // For example, {paths: ["source.id", "destination.id"]} will return flows
+        // with only these two fields set.
+        google.protobuf.FieldMask field_mask = 1;
+    }
+    Experimental experimental = 999;
 }
 
 // GetFlowsResponse contains either a flow or a protocol message.
@@ -119,9 +136,14 @@ message GetFlowsResponse {
 }
 
 message GetAgentEventsRequest {
-    // Number of agent events that should be returned. Incompatible with
-    // `since/until`.
+    // Number of flows that should be returned. Incompatible with `since/until`.
+    // Defaults to the most recent (last) `number` events, unless `first` is
+    // true, then it will return the earliest `number` events.
     uint64 number = 1;
+
+    // first specifies if we should look at the first `number` events or the
+    // last `number` of events. Incompatible with `follow`.
+    bool first = 9;
 
     // follow sets when the server should continue to stream agent events after
     // printing the last N agent events.
@@ -147,9 +169,14 @@ message GetAgentEventsResponse {
 }
 
 message GetDebugEventsRequest {
-    // Number of debug events that should be returned. Incompatible with
-    // `since/until`.
+    // Number of events that should be returned. Incompatible with `since/until`.
+    // Defaults to the most recent (last) `number` events, unless `first` is
+    // true, then it will return the earliest `number` events.
     uint64 number = 1;
+
+    // first specifies if we should look at the first `number` events or the
+    // last `number` of events. Incompatible with `follow`.
+    bool first = 9;
 
     // follow sets when the server should continue to stream debug events after
     // printing the last N debug events.

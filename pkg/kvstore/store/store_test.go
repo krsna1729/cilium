@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018-2021 Authors of Cilium
-
-//go:build !privileged_tests && integration_tests
-// +build !privileged_tests,integration_tests
+// Copyright Authors of Cilium
 
 package store
 
@@ -13,12 +10,14 @@ import (
 	"testing"
 	"time"
 
+	. "github.com/cilium/checkmate"
+
+	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/rand"
-
-	. "gopkg.in/check.v1"
+	"github.com/cilium/cilium/pkg/testutils"
 )
 
 const (
@@ -32,11 +31,19 @@ func Test(t *testing.T) {
 
 type StoreSuite struct{}
 
+func (s *StoreSuite) SetUpSuite(c *C) {
+	testutils.IntegrationCheck(c)
+}
+
 type StoreEtcdSuite struct {
 	StoreSuite
 }
 
 var _ = Suite(&StoreEtcdSuite{})
+
+func (e *StoreEtcdSuite) SetUpSuite(c *C) {
+	testutils.IntegrationCheck(c)
+}
 
 func (e *StoreEtcdSuite) SetUpTest(c *C) {
 	kvstore.SetupDummy("etcd")
@@ -44,7 +51,7 @@ func (e *StoreEtcdSuite) SetUpTest(c *C) {
 
 func (e *StoreEtcdSuite) TearDownTest(c *C) {
 	kvstore.Client().DeletePrefix(context.TODO(), testPrefix)
-	kvstore.Client().Close()
+	kvstore.Client().Close(context.TODO())
 }
 
 type StoreConsulSuite struct {
@@ -53,13 +60,17 @@ type StoreConsulSuite struct {
 
 var _ = Suite(&StoreConsulSuite{})
 
+func (e *StoreConsulSuite) SetUpSuite(c *C) {
+	testutils.IntegrationCheck(c)
+}
+
 func (e *StoreConsulSuite) SetUpTest(c *C) {
 	kvstore.SetupDummy("consul")
 }
 
 func (e *StoreConsulSuite) TearDownTest(c *C) {
 	kvstore.Client().DeletePrefix(context.TODO(), testPrefix)
-	kvstore.Client().Close()
+	kvstore.Client().Close(context.TODO())
 	time.Sleep(sharedKeyDeleteDelay + 5*time.Second)
 }
 
@@ -69,10 +80,10 @@ type TestType struct {
 
 var _ = TestType{}
 
-func (t *TestType) GetKeyName() string          { return t.Name }
-func (t *TestType) DeepKeyCopy() LocalKey       { return &TestType{Name: t.Name} }
-func (t *TestType) Marshal() ([]byte, error)    { return json.Marshal(t) }
-func (t *TestType) Unmarshal(data []byte) error { return json.Unmarshal(data, t) }
+func (t *TestType) GetKeyName() string                    { return t.Name }
+func (t *TestType) DeepKeyCopy() LocalKey                 { return &TestType{Name: t.Name} }
+func (t *TestType) Marshal() ([]byte, error)              { return json.Marshal(t) }
+func (t *TestType) Unmarshal(_ string, data []byte) error { return json.Unmarshal(data, t) }
 
 type opCounter struct {
 	deleted int
@@ -219,6 +230,7 @@ func (s *StoreSuite) TestStorePeriodicSync(c *C) {
 		Prefix:                  rand.RandomString(),
 		KeyCreator:              newTestType,
 		SynchronizationInterval: 10 * time.Millisecond,
+		SharedKeyDeleteDelay:    defaults.NodeDeleteDelay,
 		Observer:                &observer{},
 	})
 	c.Assert(err, IsNil)

@@ -9,7 +9,7 @@ pipeline {
         PROJ_PATH = "src/github.com/cilium/cilium"
         TESTDIR="${WORKSPACE}/${PROJ_PATH}/test"
         VM_MEMORY = "5120"
-        K8S_VERSION="1.22"
+        K8S_VERSION="1.26"
         KERNEL="419"
         SERVER_BOX = "cilium/ubuntu-4-19"
     }
@@ -39,7 +39,6 @@ pipeline {
         stage('Checkout') {
             steps {
                 sh 'env'
-                Status("PENDING", "${env.JOB_NAME}")
                 checkout scm
                 sh 'mkdir -p ${PROJ_PATH}'
                 sh 'ls -A | grep -v src | xargs mv -t ${PROJ_PATH}'
@@ -49,6 +48,8 @@ pipeline {
         stage('Set programmatic env vars') {
             steps {
                 script {
+                    env.IMAGE_REGISTRY = sh script: 'echo -n ${JobImageRegistry:-quay.io/cilium}', returnStdout: true
+
                     if (env.ghprbActualCommit?.trim()) {
                         env.DOCKER_TAG = env.ghprbActualCommit
                     } else {
@@ -58,16 +59,12 @@ pipeline {
                         env.DOCKER_TAG = env.DOCKER_TAG + "-race"
                         env.RACE = 1
                         env.LOCKDEBUG = 1
-                        env.BASE_IMAGE = "quay.io/cilium/cilium-runtime:f08f0c5513d5e9406f951477adfc29b16fe5a02d@sha256:5d6f733b584ec3c05dd70a98d3db22f233a87926dec26c58a94b6d771f5d9f9f"
+                        env.BASE_IMAGE = "quay.io/cilium/cilium-runtime:ff45f41cef56a42e1092d478a3914a5fa2c1f8b7@sha256:d8382f7cbbe31287e039add810b83bac5120e414149405fc1f83f9d8bb376b46"
                     }
                 }
             }
         }
         stage('Preload vagrant boxes'){
-            options {
-                timeout(time: 20, unit: 'MINUTES')
-            }
-
             steps {
                 sh '/usr/local/bin/add_vagrant_box ${WORKSPACE}/${PROJ_PATH}/vagrant_box_defaults.rb'
             }
@@ -96,14 +93,14 @@ pipeline {
             }
 
             steps {
-                sh 'cd ${TESTDIR}; vagrant ssh k8s1-${K8S_VERSION} -c "cd /home/vagrant/go/${PROJ_PATH}; sudo ./test/kubernetes-test.sh ${DOCKER_TAG}"'
+                sh 'cd ${TESTDIR}; vagrant ssh k8s1-${K8S_VERSION} -c "cd /home/vagrant/go/${PROJ_PATH}; sudo ./test/kubernetes-test.sh ${IMAGE_REGISTRY} ${DOCKER_TAG}"'
             }
         }
 
         stage('Netperf tests'){
 
             when {
-                environment name: 'GIT_BRANCH', value: 'origin/master'
+                environment name: 'GIT_BRANCH', value: 'origin/main'
             }
 
             options {
@@ -130,12 +127,6 @@ pipeline {
             sh 'cd ${TESTDIR}; K8S_VERSION=${K8S_VERSION} vagrant destroy -f || true'
             cleanWs()
             sh '/usr/local/bin/cleanup || true'
-        }
-        success {
-            Status("SUCCESS", "$JOB_BASE_NAME")
-        }
-        failure {
-            Status("FAILURE", "$JOB_BASE_NAME")
         }
     }
 }

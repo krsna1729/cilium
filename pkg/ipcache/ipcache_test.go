@@ -1,34 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018-2021 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package ipcache
 
 import (
+	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
+	"strconv"
 	"testing"
 
-	"github.com/cilium/cilium/pkg/checker"
-	identityPkg "github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/policy"
-	"github.com/cilium/cilium/pkg/source"
-	"github.com/cilium/cilium/pkg/u8proto"
+	. "github.com/cilium/checkmate"
 
-	. "gopkg.in/check.v1"
+	"github.com/cilium/cilium/pkg/checker"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	identityPkg "github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/source"
+	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
+	"github.com/cilium/cilium/pkg/types"
+	"github.com/cilium/cilium/pkg/u8proto"
 )
 
 // Hook up gocheck into the "go test" runner.
-type IPCacheTestSuite struct{}
+type IPCacheTestSuite struct {
+	cleanup func()
+}
 
-var _ = Suite(&IPCacheTestSuite{})
+var (
+	_               = Suite(&IPCacheTestSuite{})
+	IPIdentityCache *IPCache
+)
 
 func Test(t *testing.T) {
 	TestingT(t)
+}
+
+func (s *IPCacheTestSuite) SetUpTest(c *C) {
+	ctx, cancel := context.WithCancel(context.Background())
+	allocator := testidentity.NewMockIdentityAllocator(nil)
+	IPIdentityCache = NewIPCache(&Configuration{
+		Context:           ctx,
+		IdentityAllocator: allocator,
+		PolicyHandler:     &mockUpdater{},
+		DatapathHandler:   &mockTriggerer{},
+		NodeIDHandler:     &mockNodeIDHandler{},
+	})
+
+	s.cleanup = func() {
+		cancel()
+		IPIdentityCache.Shutdown()
+	}
+}
+
+func (s *IPCacheTestSuite) TearDownTest(c *C) {
+	s.cleanup()
 }
 
 func (s *IPCacheTestSuite) TestIPCache(c *C) {
@@ -125,8 +154,8 @@ func (s *IPCacheTestSuite) TestIPCache(c *C) {
 	c.Assert(len(IPIdentityCache.ipToK8sMetadata), Equals, 0)
 
 	// Test mapping of multiple IPs to same identity.
-	endpointIPs := []string{"192.168.0.1", "20.3.75.3", "27.2.2.2", "127.0.0.1", "127.0.0.1"}
-	identities := []identityPkg.NumericIdentity{5, 67, 29, 29, 29}
+	endpointIPs := []string{"192.168.0.1", "20.3.75.3", "27.2.2.2", "127.0.0.1", "127.0.0.1", "10.1.1.250"}
+	identities := []identityPkg.NumericIdentity{5, 67, 29, 29, 29, 42}
 
 	for index := range endpointIPs {
 		IPIdentityCache.Upsert(endpointIPs[index], nil, 0, nil, Identity{
@@ -166,6 +195,36 @@ func (s *IPCacheTestSuite) TestIPCache(c *C) {
 	_, exists = IPIdentityCache.LookupByPrefix("127.0.0.1/32")
 	c.Assert(exists, Equals, false)
 
+	// Assert IPCache entry is overwritten when a different pod (different
+	// k8sMeta) with the same IP as what's already inside the IPCache is
+	// inserted.
+	_, err = IPIdentityCache.Upsert("10.1.1.250", net.ParseIP("10.0.0.1"), 0, &K8sMetadata{
+		Namespace: "ns-1",
+		PodName:   "pod1",
+	}, Identity{
+		ID:     42,
+		Source: source.KVStore,
+	})
+	c.Assert(err, IsNil)
+	_, exists = IPIdentityCache.LookupByPrefix("10.1.1.250/32")
+	c.Assert(exists, Equals, true)
+	// Insert different pod now.
+	_, err = IPIdentityCache.Upsert("10.1.1.250", net.ParseIP("10.0.0.2"), 0, &K8sMetadata{
+		Namespace: "ns-1",
+		PodName:   "pod2",
+	}, Identity{
+		ID:     43,
+		Source: source.KVStore,
+	})
+	c.Assert(err, IsNil)
+	cachedIdentity, _ = IPIdentityCache.LookupByPrefix("10.1.1.250/32")
+	c.Assert(cachedIdentity.ID, Equals, identityPkg.NumericIdentity(43)) // Assert entry overwritten.
+	// Assuming different pod with same IP 10.1.1.250 as a previous pod was
+	// deleted, assert IPCache entry is deleted is still deleted.
+	IPIdentityCache.Delete("10.1.1.250", source.KVStore)
+	_, exists = IPIdentityCache.LookupByPrefix("10.1.1.250/32")
+	c.Assert(exists, Equals, false) // Assert entry deleted.
+
 	// Clean up.
 	for index := range endpointIPs {
 		IPIdentityCache.Delete(endpointIPs[index], source.KVStore)
@@ -178,7 +237,6 @@ func (s *IPCacheTestSuite) TestIPCache(c *C) {
 
 	c.Assert(len(IPIdentityCache.ipToIdentityCache), Equals, 0)
 	c.Assert(len(IPIdentityCache.identityToIPCache), Equals, 0)
-
 }
 
 func (s *IPCacheTestSuite) TestKeyToIPNet(c *C) {
@@ -263,9 +321,9 @@ func (s *IPCacheTestSuite) TestIPCacheNamedPorts(c *C) {
 	meta := K8sMetadata{
 		Namespace: "default",
 		PodName:   "app1",
-		NamedPorts: policy.NamedPortMap{
-			"http": policy.PortProto{Port: 80, Proto: uint8(u8proto.TCP)},
-			"dns":  policy.PortProto{Port: 53},
+		NamedPorts: types.NamedPortMap{
+			"http": types.PortProto{Port: 80, Proto: uint8(u8proto.TCP)},
+			"dns":  types.PortProto{Port: 53},
 		},
 	}
 
@@ -286,13 +344,18 @@ func (s *IPCacheTestSuite) TestIPCacheNamedPorts(c *C) {
 	c.Assert(cachedIdentity.ID, Equals, identity)
 	c.Assert(cachedIdentity.Source, Equals, source.Kubernetes)
 
-	// Named ports have been updated
-	c.Assert(namedPortsChanged, Equals, false) // not before GetNamedPorts() has been called once
+	// Named ports have been updated, but no policy uses them, hence don't
+	// trigger policy regen until GetNamedPorts has been called at least once.
+	c.Assert(namedPortsChanged, Equals, false)
 	npm := IPIdentityCache.GetNamedPorts()
 	c.Assert(npm, NotNil)
-	c.Assert(len(npm), Equals, 2)
-	c.Assert(npm["http"], checker.HasKey, policy.PortProto{Port: uint16(80), Proto: uint8(6)})
-	c.Assert(npm["dns"], checker.HasKey, policy.PortProto{Port: uint16(53), Proto: uint8(0)})
+	c.Assert(npm.Len(), Equals, 2)
+	port, err := npm.GetNamedPort("http", uint8(6))
+	c.Assert(err, IsNil)
+	c.Assert(port, Equals, uint16(80))
+	port, err = npm.GetNamedPort("dns", uint8(0))
+	c.Assert(err, IsNil)
+	c.Assert(port, Equals, uint16(53))
 
 	// No duplicates.
 	c.Assert(len(IPIdentityCache.ipToIdentityCache), Equals, 1)
@@ -312,9 +375,9 @@ func (s *IPCacheTestSuite) TestIPCacheNamedPorts(c *C) {
 	meta2 := K8sMetadata{
 		Namespace: "testing",
 		PodName:   "app2",
-		NamedPorts: policy.NamedPortMap{
-			"https": policy.PortProto{Port: 443, Proto: uint8(u8proto.TCP)},
-			"dns":   policy.PortProto{Port: 53},
+		NamedPorts: types.NamedPortMap{
+			"https": types.PortProto{Port: 443, Proto: uint8(u8proto.TCP)},
+			"dns":   types.PortProto{Port: 53},
 		},
 	}
 
@@ -339,18 +402,29 @@ func (s *IPCacheTestSuite) TestIPCacheNamedPorts(c *C) {
 	c.Assert(namedPortsChanged, Equals, true)
 	npm = IPIdentityCache.GetNamedPorts()
 	c.Assert(npm, NotNil)
-	c.Assert(len(npm), Equals, 3)
-	c.Assert(npm["http"], checker.HasKey, policy.PortProto{Port: uint16(80), Proto: uint8(6)})
-	c.Assert(npm["dns"], checker.HasKey, policy.PortProto{Port: uint16(53), Proto: uint8(0)})
-	c.Assert(npm["https"], checker.HasKey, policy.PortProto{Port: uint16(443), Proto: uint8(6)})
+	c.Assert(npm.Len(), Equals, 3)
+	port, err = npm.GetNamedPort("http", uint8(6))
+	c.Assert(err, IsNil)
+	c.Assert(port, Equals, uint16(80))
+	port, err = npm.GetNamedPort("dns", uint8(0))
+	c.Assert(err, IsNil)
+	c.Assert(port, Equals, uint16(53))
+	port, err = npm.GetNamedPort("https", uint8(6))
+	c.Assert(err, IsNil)
+	c.Assert(port, Equals, uint16(443))
 
 	namedPortsChanged = IPIdentityCache.Delete(endpointIP, source.Kubernetes)
 	c.Assert(namedPortsChanged, Equals, true)
 	npm = IPIdentityCache.GetNamedPorts()
 	c.Assert(npm, NotNil)
-	c.Assert(len(npm), Equals, 2)
-	c.Assert(npm["dns"], checker.HasKey, policy.PortProto{Port: uint16(53), Proto: uint8(0)})
-	c.Assert(npm["https"], checker.HasKey, policy.PortProto{Port: uint16(443), Proto: uint8(6)})
+	c.Assert(npm.Len(), Equals, 2)
+
+	port, err = npm.GetNamedPort("dns", uint8(0))
+	c.Assert(err, IsNil)
+	c.Assert(port, Equals, uint16(53))
+	port, err = npm.GetNamedPort("https", uint8(6))
+	c.Assert(err, IsNil)
+	c.Assert(port, Equals, uint16(443))
 
 	// Assure deletion occurs across all mappings.
 	c.Assert(len(IPIdentityCache.ipToIdentityCache), Equals, 1)
@@ -423,8 +497,8 @@ func (s *IPCacheTestSuite) TestIPCacheNamedPorts(c *C) {
 	// Test mapping of multiple IPs to same identity.
 	endpointIPs := []string{"192.168.0.1", "20.3.75.3", "27.2.2.2", "127.0.0.1", "127.0.0.1"}
 	identities := []identityPkg.NumericIdentity{5, 67, 29, 29, 29}
-	k8sMeta.NamedPorts = policy.NamedPortMap{
-		"http2": policy.PortProto{Port: 8080, Proto: uint8(u8proto.TCP)},
+	k8sMeta.NamedPorts = types.NamedPortMap{
+		"http2": types.PortProto{Port: 8080, Proto: uint8(u8proto.TCP)},
 	}
 
 	for index := range endpointIPs {
@@ -436,7 +510,9 @@ func (s *IPCacheTestSuite) TestIPCacheNamedPorts(c *C) {
 		c.Assert(err, IsNil)
 		npm = IPIdentityCache.GetNamedPorts()
 		c.Assert(npm, NotNil)
-		c.Assert(npm["http2"], checker.HasKey, policy.PortProto{Port: uint16(8080), Proto: uint8(6)})
+		port, err := npm.GetNamedPort("http2", uint8(6))
+		c.Assert(err, IsNil)
+		c.Assert(port, Equals, uint16(8080))
 		// only the first changes named ports, as they are all the same
 		c.Assert(namedPortsChanged, Equals, index == 0)
 		cachedIdentity, _ := IPIdentityCache.LookupByIP(endpointIPs[index])
@@ -495,7 +571,76 @@ func (s *IPCacheTestSuite) TestIPCacheNamedPorts(c *C) {
 	namedPortsChanged = IPIdentityCache.Delete(endpointIP2, source.Kubernetes)
 	c.Assert(namedPortsChanged, Equals, true)
 	npm = IPIdentityCache.GetNamedPorts()
-	c.Assert(npm, IsNil)
+	c.Assert(npm.Len(), Equals, 0)
+}
+
+func BenchmarkIPCacheUpsert10(b *testing.B) {
+	benchmarkIPCacheUpsert(b, 10)
+}
+
+func BenchmarkIPCacheUpsert100(b *testing.B) {
+	benchmarkIPCacheUpsert(b, 100)
+}
+
+func BenchmarkIPCacheUpsert1000(b *testing.B) {
+	benchmarkIPCacheUpsert(b, 1000)
+}
+
+func BenchmarkIPCacheUpsert10000(b *testing.B) {
+	benchmarkIPCacheUpsert(b, 10000)
+}
+
+func benchmarkIPCacheUpsert(b *testing.B, num int) {
+	meta := K8sMetadata{
+		Namespace: "default",
+		PodName:   "app",
+		NamedPorts: types.NamedPortMap{
+			"http": types.PortProto{Port: 80, Proto: uint8(u8proto.TCP)},
+			"dns":  types.PortProto{Port: 53},
+		},
+	}
+
+	buf := make([]byte, 4)
+	ips := make([]string, num)
+	nms := make([]string, num)
+	for i := range nms {
+		binary.BigEndian.PutUint32(buf, uint32(i+2<<26))
+		ip, _ := netip.AddrFromSlice(buf)
+		ips[i] = ip.String()
+		nms[i] = strconv.Itoa(i)
+	}
+
+	b.StopTimer()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		allocator := testidentity.NewMockIdentityAllocator(nil)
+		ipcache := NewIPCache(&Configuration{
+			Context:           ctx,
+			IdentityAllocator: allocator,
+			PolicyHandler:     &mockUpdater{},
+			DatapathHandler:   &mockTriggerer{},
+			NodeIDHandler:     &mockNodeIDHandler{},
+		})
+
+		// We only want to measure the calls to upsert.
+		b.StartTimer()
+		for j := 0; j < num; j++ {
+			meta.PodName = nms[j]
+			_, err := ipcache.Upsert(ips[j], nil, 0, &meta, Identity{
+				ID:     identityPkg.NumericIdentity(j),
+				Source: source.Kubernetes,
+			})
+			if err != nil {
+				b.Fatalf("failed to upsert: %v", err)
+			}
+		}
+		b.StopTimer()
+
+		// Clean up after ourselves, so that the individual runs are comparable.
+		cancel()
+		ipcache.Shutdown()
+	}
 }
 
 type dummyListener struct {
@@ -510,12 +655,12 @@ func newDummyListener(ipc *IPCache) *dummyListener {
 }
 
 func (dl *dummyListener) OnIPIdentityCacheChange(modType CacheModification,
-	cidr net.IPNet, oldHostIP, newHostIP net.IP, oldID *Identity,
-	newID Identity, encryptKey uint8, k8sMeta *K8sMetadata) {
+	cidrCluster cmtypes.PrefixCluster, oldHostIP, newHostIP net.IP, oldID *Identity,
+	newID Identity, encryptKey uint8, _ uint16, k8sMeta *K8sMetadata) {
 
 	switch modType {
 	case Upsert:
-		dl.entries[cidr.String()] = newID.ID
+		dl.entries[cidrCluster.String()] = newID.ID
 	default:
 		// Ignore, for simplicity we just clear the cache every time
 	}
@@ -543,7 +688,7 @@ func (s *IPCacheTestSuite) TestIPCacheShadowing(c *C) {
 	cidrOverlap := "10.0.0.15/32"
 	epIdentity := (identityPkg.NumericIdentity(68))
 	cidrIdentity := (identityPkg.NumericIdentity(202))
-	ipc := NewIPCache()
+	ipc := IPIdentityCache
 
 	// Assure sane state at start.
 	c.Assert(ipc.ipToIdentityCache, checker.DeepEquals, map[string]Identity{})
@@ -580,4 +725,14 @@ func (s *IPCacheTestSuite) TestIPCacheShadowing(c *C) {
 	ipc.Delete(endpointIP, source.KVStore)
 	_, exists := ipc.LookupByPrefix(cidrOverlap)
 	c.Assert(exists, Equals, false)
+}
+
+type mockNodeIDHandler struct{}
+
+func (m *mockNodeIDHandler) AllocateNodeID(_ net.IP) uint16 {
+	return 0
+}
+
+func (m *mockNodeIDHandler) GetNodeIP(_ uint16) string {
+	return ""
 }

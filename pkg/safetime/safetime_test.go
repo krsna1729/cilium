@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package safetime
 
@@ -13,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-	. "gopkg.in/check.v1"
+	. "github.com/cilium/checkmate"
+	"github.com/sirupsen/logrus"
 )
 
 // Hook up gocheck into the "go test" runner.
@@ -24,16 +21,16 @@ func Test(t *testing.T) {
 
 type SafetimeSuite struct {
 	out    *bytes.Buffer // stores log output
-	logger *log.Entry
+	logger *logrus.Entry
 }
 
 var _ = Suite(&SafetimeSuite{})
 
 func (s *SafetimeSuite) SetUpTest(c *C) {
 	s.out = &bytes.Buffer{}
-	logger := log.New()
+	logger := logrus.New()
 	logger.Out = s.out
-	s.logger = log.NewEntry(logger)
+	s.logger = logrus.NewEntry(logger)
 }
 
 func (s *SafetimeSuite) TestNegativeDuration(c *C) {

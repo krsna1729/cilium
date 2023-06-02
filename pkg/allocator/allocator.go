@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package allocator
 
@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/idpool"
@@ -18,9 +21,6 @@ import (
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/rate"
-
-	"github.com/google/uuid"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -49,29 +49,31 @@ const (
 // Note that the numeric IDs are selected locally and verified with the Backend.
 //
 // Lookup ID by key:
-// 1. Return ID from local cache updated by watcher (no Backend interactions)
-// 2. Do ListPrefix() on slave key excluding node suffix, return the first
-//    result that matches the exact prefix.
+//  1. Return ID from local cache updated by watcher (no Backend interactions)
+//  2. Do ListPrefix() on slave key excluding node suffix, return the first
+//     result that matches the exact prefix.
 //
 // Lookup key by ID:
-// 1. Return key from local cache updated by watcher (no Backend interactions)
-// 2. Do Get() on master key, return result
+//  1. Return key from local cache updated by watcher (no Backend interactions)
+//  2. Do Get() on master key, return result
 //
 // Allocate:
-// 1. Check local key cache, increment, and return if key is already in use
-//    locally (no Backend interactions)
-// 2. Check local cache updated by watcher, if...
+//  1. Check local key cache, increment, and return if key is already in use
+//     locally (no Backend interactions)
+//  2. Check local cache updated by watcher, if...
 //
 // ... match found:
-// 2.1 Create a new slave key. This operation is potentially racy as the master
-//     key can be removed in the meantime.
-//       etcd: Create is made conditional on existence of master key
-//       consul: locking
+//
+//	2.1 Create a new slave key. This operation is potentially racy as the master
+//	    key can be removed in the meantime.
+//	    - etcd: Create is made conditional on existence of master key
+//	    - consul: locking
 //
 // ... match not found:
-// 2.1 Select new unused id from local cache
-// 2.2 Create a new master key with the condition that it may not exist
-// 2.3 Create a new slave key
+//
+//	2.1 Select new unused id from local cache
+//	2.2 Create a new master key with the condition that it may not exist
+//	2.3 Create a new slave key
 //
 // 1.1. If found, increment and return (no Backend interactions)
 // 2. Lookup ID by key in local cache or via first slave key found in Backend
@@ -86,7 +88,7 @@ const (
 type Allocator struct {
 	// events is a channel which will receive AllocatorEvent as IDs are
 	// added, modified or removed from the allocator
-	events AllocatorEventChan
+	events AllocatorEventSendChan
 
 	// keyType is an instance of the type to be used as allocator key.
 	keyType AllocatorKey
@@ -127,7 +129,7 @@ type Allocator struct {
 
 	// remoteCaches is the list of additional remote caches being watched
 	// in addition to the main cache
-	remoteCaches map[*RemoteCache]struct{}
+	remoteCaches map[string]*RemoteCache
 
 	// stopGC is the channel used to stop the garbage collector
 	stopGC chan struct{}
@@ -155,8 +157,22 @@ type Allocator struct {
 type AllocatorOption func(*Allocator)
 
 // NewAllocatorForGC returns an allocator that can be used to run RunGC()
-func NewAllocatorForGC(backend Backend) *Allocator {
-	return &Allocator{backend: backend}
+//
+// The allocator can be configured by passing in additional options:
+//   - WithMin(id) - minimum ID to allocate (default: 1)
+//   - WithMax(id) - maximum ID to allocate (default max(uint64))
+func NewAllocatorForGC(backend Backend, opts ...AllocatorOption) *Allocator {
+	a := &Allocator{
+		backend: backend,
+		min:     idpool.ID(1),
+		max:     idpool.ID(^uint64(0)),
+	}
+
+	for _, fn := range opts {
+		fn(a)
+	}
+
+	return a
 }
 
 type GCStats struct {
@@ -237,7 +253,7 @@ type Backend interface {
 	// by cilium-agent.
 	// Note: not all Backend implemenations rely on this, such as the kvstore
 	// backends, and may use leases to expire keys.
-	RunGC(ctx context.Context, rateLimit *rate.Limiter, staleKeysPrevRound map[string]uint64) (map[string]uint64, *GCStats, error)
+	RunGC(ctx context.Context, rateLimit *rate.Limiter, staleKeysPrevRound map[string]uint64, minID idpool.ID, maxID idpool.ID) (map[string]uint64, *GCStats, error)
 
 	// RunLocksGC reaps stale or unused locks within the Backend. It is used by
 	// the cilium-operator and is not invoked by cilium-agent. Returns
@@ -258,9 +274,9 @@ type Backend interface {
 // unique.
 //
 // The allocator can be configured by passing in additional options:
-//  - WithEvents() - enable Events channel
-//  - WithMin(id) - minimum ID to allocate (default: 1)
-//  - WithMax(id) - maximum ID to allocate (default max(uint64))
+//   - WithEvents() - enable Events channel
+//   - WithMin(id) - minimum ID to allocate (default: 1)
+//   - WithMax(id) - maximum ID to allocate (default max(uint64))
 //
 // After creation, IDs can be allocated with Allocate() and released with
 // Release()
@@ -273,7 +289,7 @@ func NewAllocator(typ AllocatorKey, backend Backend, opts ...AllocatorOption) (*
 		localKeys:    newLocalKeys(),
 		stopGC:       make(chan struct{}),
 		suffix:       uuid.New().String()[:10],
-		remoteCaches: map[*RemoteCache]struct{}{},
+		remoteCaches: map[string]*RemoteCache{},
 		backoffTemplate: backoff.Exponential{
 			Min:    time.Duration(20) * time.Millisecond,
 			Factor: 2.0,
@@ -295,7 +311,7 @@ func NewAllocator(typ AllocatorKey, backend Backend, opts ...AllocatorOption) (*
 	}
 
 	if a.max <= a.min {
-		return nil, errors.New("maximum ID must be greater than minimum ID")
+		return nil, fmt.Errorf("maximum ID must be greater than minimum ID: configured max %v, min %v", a.max, a.min)
 	}
 
 	a.idPool = idpool.NewIDPool(a.min, a.max)
@@ -329,7 +345,7 @@ func WithBackend(backend Backend) AllocatorOption {
 // read while NewAllocator() is being called to ensure that the channel does
 // not block indefinitely while NewAllocator() emits events on it while
 // populating the initial cache.
-func WithEvents(events AllocatorEventChan) AllocatorOption {
+func WithEvents(events AllocatorEventSendChan) AllocatorOption {
 	return func(a *Allocator) { a.events = events }
 }
 
@@ -365,7 +381,7 @@ func WithoutGC() AllocatorOption {
 // GetEvents returns the events channel given to the allocator when
 // constructed.
 // Note: This channel is not owned by the allocator!
-func (a *Allocator) GetEvents() AllocatorEventChan {
+func (a *Allocator) GetEvents() AllocatorEventSendChan {
 	return a.events
 }
 
@@ -373,10 +389,6 @@ func (a *Allocator) GetEvents() AllocatorEventChan {
 func (a *Allocator) Delete() {
 	close(a.stopGC)
 	a.mainCache.stop()
-
-	if a.events != nil {
-		close(a.events)
-	}
 }
 
 // WaitForInitialSync waits until the initial sync is complete
@@ -399,7 +411,7 @@ func (a *Allocator) ForeachCache(cb RangeFunc) {
 	a.mainCache.foreach(cb)
 
 	a.remoteCachesMutex.RLock()
-	for rc := range a.remoteCaches {
+	for _, rc := range a.remoteCaches {
 		rc.cache.foreach(cb)
 	}
 	a.remoteCachesMutex.RUnlock()
@@ -427,7 +439,7 @@ type AllocatorKey interface {
 	// GetKey returns the canonical string representation of the key
 	GetKey() string
 
-	// PutKey stores the information in v into the key. This is is the inverse
+	// PutKey stores the information in v into the key. This is the inverse
 	// operation to GetKey
 	PutKey(v string) AllocatorKey
 
@@ -445,11 +457,11 @@ func (a *Allocator) encodeKey(key AllocatorKey) string {
 }
 
 // Return values:
-// 1. allocated ID
-// 2. whether the ID is newly allocated from kvstore
-// 3. whether this is the first owner that holds a reference to the key in
-//    localkeys store
-// 4. error in case of failure
+//  1. allocated ID
+//  2. whether the ID is newly allocated from kvstore
+//  3. whether this is the first owner that holds a reference to the key in
+//     localkeys store
+//  4. error in case of failure
 func (a *Allocator) lockedAllocate(ctx context.Context, key AllocatorKey) (idpool.ID, bool, bool, error) {
 	var firstUse bool
 
@@ -588,11 +600,11 @@ func (a *Allocator) lockedAllocate(ctx context.Context, key AllocatorKey) (idpoo
 // allocation is re-attempted for maxAllocAttempts times.
 //
 // Return values:
-// 1. allocated ID
-// 2. whether the ID is newly allocated from kvstore
-// 3. whether this is the first owner that holds a reference to the key in
-//    localkeys store
-// 4. error in case of failure
+//  1. allocated ID
+//  2. whether the ID is newly allocated from kvstore
+//  3. whether this is the first owner that holds a reference to the key in
+//     localkeys store
+//  4. error in case of failure
 func (a *Allocator) Allocate(ctx context.Context, key AllocatorKey) (idpool.ID, bool, bool, error) {
 	var (
 		err      error
@@ -711,7 +723,7 @@ func (a *Allocator) GetIncludeRemoteCaches(ctx context.Context, key AllocatorKey
 
 	// check remote caches
 	a.remoteCachesMutex.RLock()
-	for rc := range a.remoteCaches {
+	for _, rc := range a.remoteCaches {
 		if id := rc.cache.get(encoded); id != idpool.NoID {
 			a.remoteCachesMutex.RUnlock()
 			return id, nil
@@ -741,7 +753,7 @@ func (a *Allocator) GetByIDIncludeRemoteCaches(ctx context.Context, id idpool.ID
 
 	// check remote caches
 	a.remoteCachesMutex.RLock()
-	for rc := range a.remoteCaches {
+	for _, rc := range a.remoteCaches {
 		if key := rc.cache.getByID(id); key != nil {
 			a.remoteCachesMutex.RUnlock()
 			return key, nil
@@ -797,7 +809,7 @@ func (a *Allocator) Release(ctx context.Context, key AllocatorKey) (lastUse bool
 
 // RunGC scans the kvstore for unused master keys and removes them
 func (a *Allocator) RunGC(rateLimit *rate.Limiter, staleKeysPrevRound map[string]uint64) (map[string]uint64, *GCStats, error) {
-	return a.backend.RunGC(context.TODO(), rateLimit, staleKeysPrevRound)
+	return a.backend.RunGC(context.TODO(), rateLimit, staleKeysPrevRound, a.min, a.max)
 }
 
 // RunLocksGC scans the kvstore for stale locks and removes them
@@ -855,6 +867,10 @@ func (a *Allocator) startLocalKeySync() {
 // AllocatorEventChan is a channel to receive allocator events on
 type AllocatorEventChan chan AllocatorEvent
 
+// Send- and receive-only versions of the above.
+type AllocatorEventRecvChan = <-chan AllocatorEvent
+type AllocatorEventSendChan = chan<- AllocatorEvent
+
 // AllocatorEvent is an event sent over AllocatorEventChan
 type AllocatorEvent struct {
 	// Typ is the type of event (create / modify / delete)
@@ -871,26 +887,31 @@ type AllocatorEvent struct {
 // identities. The contents are not directly accessible but will be merged into
 // the ForeachCache() function.
 type RemoteCache struct {
-	cache cache
+	cache *cache
 }
 
 // WatchRemoteKVStore starts watching an allocator base prefix the kvstore
 // represents by the provided backend. A local cache of all identities of that
 // kvstore will be maintained in the RemoteCache structure returned and will
 // start being reported in the identities returned by the ForeachCache()
-// function.
-func (a *Allocator) WatchRemoteKVStore(remoteAlloc *Allocator) *RemoteCache {
+// function. RemoteName should be unique per logical "remote".
+func (a *Allocator) WatchRemoteKVStore(remoteName string, remoteAlloc *Allocator) *RemoteCache {
 	rc := &RemoteCache{
-		cache: newCache(remoteAlloc),
+		cache: &remoteAlloc.mainCache,
 	}
 
 	a.remoteCachesMutex.Lock()
-	a.remoteCaches[rc] = struct{}{}
+	a.remoteCaches[remoteName] = rc
 	a.remoteCachesMutex.Unlock()
 
-	rc.cache.start()
-
 	return rc
+}
+
+// RemoveRemoteKVStore removes any reference to a remote allocator / kvstore.
+func (a *Allocator) RemoveRemoteKVStore(remoteName string) {
+	a.remoteCachesMutex.Lock()
+	delete(a.remoteCaches, remoteName)
+	a.remoteCachesMutex.Unlock()
 }
 
 // NumEntries returns the number of entries in the remote cache
@@ -903,11 +924,7 @@ func (rc *RemoteCache) NumEntries() int {
 }
 
 // Close stops watching for identities in the kvstore associated with the
-// remote cache and will clear the local cache.
+// remote cache.
 func (rc *RemoteCache) Close() {
-	rc.cache.allocator.remoteCachesMutex.Lock()
-	delete(rc.cache.allocator.remoteCaches, rc)
-	rc.cache.allocator.remoteCachesMutex.Unlock()
-
-	rc.cache.stop()
+	rc.cache.allocator.Delete()
 }

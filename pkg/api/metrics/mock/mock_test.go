@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2020 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package mock
 
@@ -10,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/check.v1"
+	check "github.com/cilium/checkmate"
 )
 
 func Test(t *testing.T) {

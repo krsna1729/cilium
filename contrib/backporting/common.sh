@@ -1,18 +1,6 @@
-#!/bin/bash
-#
-# Copyright 2019-2021 Authors of Cilium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Authors of Cilium
 
 set -e
 
@@ -32,19 +20,40 @@ get_remote () {
   echo "$remote"
 }
 
+get_user() {
+  gh_username=$(hub api user --flat | awk '/.login/ {print $2}')
+  if [ "$gh_username" = "" ]; then
+    echo "Error: could not get user info from hub" 1>&2
+    exit 1
+  fi
+  echo $gh_username
+}
+
 # $1 - override
 get_user_remote() {
   USER_REMOTE=${1:-}
   if [ "$USER_REMOTE" = "" ]; then
-      gh_username=$(hub api user --flat | awk '/.login/ {print $2}')
-      if [ "$gh_username" = "" ]; then
-          echo "Error: could not get user info from hub" 1>&2
-          exit 1
-      fi
+      gh_username=$(get_user)
       USER_REMOTE=$(get_remote "$gh_username")
       echo "Using GitHub repository ${gh_username}/cilium (git remote: ${USER_REMOTE})" 1>&2
   fi
   echo $USER_REMOTE
+}
+
+is_collaborator() {
+  local username=${1:-}
+  local org=${2:-cilium}
+  local repo=${3:-cilium}
+  if [ -z "$username" ]; then
+      echo "Error: no username specified in is_collaborator"
+      exit 1
+  fi
+  local path="repos/$org/$repo/collaborators/$username"
+  if hub api "$path" &> /dev/null; then
+    echo "yes"
+  else
+    echo "no"
+  fi
 }
 
 require_linux() {
@@ -68,7 +77,7 @@ get_branch_from_version() {
     local remote="$1"
     local branch="$(echo $2 | sed 's/.*\(v[0-9]\+\.[0-9]\+\).*/\1/')"
     if [ -z "$(git ls-remote --heads $remote $branch)" ]; then
-        branch="master"
+        branch="main"
     fi
     echo "$branch"
 }

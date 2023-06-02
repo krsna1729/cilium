@@ -87,7 +87,7 @@ build your own cilium-runtime and cilium-builder images:
 
 .. code-block:: shell-session
 
-    make docker-image-runtime
+    make -C images runtime-image
 
 After the build finishes update the runtime image references in other
 Dockerfiles (``docker buildx imagetools inspect`` is useful for finding
@@ -95,7 +95,7 @@ image information). Then proceed to build the cilium-builder:
 
 .. code-block:: shell-session
 
-    make docker-image-builder
+    make -C images builder-image
 
 After the build finishes update the main Cilium Dockerfile with the
 new builder reference, then proceed to build Hubble from
@@ -190,59 +190,68 @@ Image dependency:
               docker.io/cilium/cilium-llvm
 
 
+
+.. _update_cilim_builder_runtime_images:
+
 Update cilium-builder and cilium-runtime images
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-#. cilium-builder depends on cilium-runtime so one needs to update
-   cilium-runtime first. Steps 4 and 7 will fetch the digest of the image built
-   by GitHub actions.
+The steps described here, starting with a commit that updates the image
+versions, build the necessary images and update all the appropriate
+locations in the Cilium codebase. Hence, before executing the following steps,
+the user should have such a commit (e.g., see
+`this commit
+<https://github.com/cilium/cilium/pull/17713/commits/b7a37ff80df8681d25a24fd5b464082d360fc6e2>`__)
+in their local tree. After following the steps below, the result would be another
+commit with the image updates (e.g,. see `this commit
+<https://github.com/cilium/cilium/pull/17713/commits/bd3357704647117fa9ef4839b9f603cd0435b7cc>`__).
+Please keep the two commits separate to ease backporting.
 
-   .. code-block:: shell-session
-
-       $ make -C images/ update-runtime-image
+If you only wish to update the packages in these images, then you can manually
+update the ``FORCE_BUILD`` variable in ``images/runtime/Dockerfile`` to have a
+different value and then proceed with the steps below.
 
 #. Commit your changes and create a PR in cilium/cilium.
 
    .. code-block:: shell-session
 
-       $ git commit -s -a -m "update cilium-{runtime,builder}"
+       $ git commit -sam "images: update cilium-{runtime,builder}"
 
 #. Ping one of the members of `team/build <https://github.com/orgs/cilium/teams/build/members>`__
    to approve the build that was created by GitHub Actions `here <https://github.com/cilium/cilium/actions?query=workflow:%22Base+Image+Release+Build%22>`__.
    Note that at this step cilium-builder build failure is expected since we have yet to update the runtime digest.
 
-#. Wait for cilium-runtime build to complete. Only after the image is available run:
+#. Wait for build to complete. If the PR was opened from an external fork the
+   build will fail while trying to push the changes, this is expected.
+
+#. If the PR was opened from an external fork, run the following commands and
+   re-push the changes to your branch. Once this is done the CI can be executed.
 
    .. code-block:: shell-session
 
-       $ make -C images/ update-runtime-image update-builder-image
+       $ make -C images/ update-runtime-image
+       $ git commit -sam "images: update cilium-{runtime,builder}" --amend
+       $ make -C images/ update-builder-image
+       $ git commit -sam "images: update cilium-{runtime,builder}" --amend
 
-#. Commit your changes and re-push to the PR in cilium/cilium.
+#. If the PR was opened from the main repository, the build will automatically
+   generate one commit and push it to your branch with all the necessary changes
+   across files in the repository. Once this is done the CI can be executed.
 
-   .. code-block:: shell-session
+#. After merging the PR, do the following steps to update the versions of the
+   images that are pulled into the CI VMs.
 
-       $ git commit --amend -s -a
+* Open a PR against the :ref:`packer_ci` with an update to said image versions.
+  Once your PR is merged and the new boxes are built, a new version of the VM
+  will be ready for consumption in the CI.
+* Update all ``*SERVER_VERSION`` fields in ``vagrant_box_defaults.rb`` to
+  contain the new versions, which is the build number from the `Jenkins Jobs for
+  the VMs <https://jenkins.cilium.io/view/Packer%20builds/>`_. For example,
+  build 72 from the pipeline would be the value to set for ``SERVER_VERSION``.
+* After merging the `packer-ci-build`_ PR, open a pull request with this version
+  change in the cilium repository.
 
-#. Ping one of the members of `team/build <https://github.com/orgs/cilium/teams/build/members>`__
-   to approve the build that was created by GitHub Actions `here <https://github.com/cilium/cilium/actions?query=workflow:%22Base+Image+Release+Build%22>`__.
-
-#. Wait for the build to complete. Only after the image is available run:
-
-   .. code-block:: shell-session
-
-       $ make -C images/ update-runtime-image update-builder-image
-
-#. Commit your changes and re-push to the PR in cilium/cilium.
-
-   .. code-block:: shell-session
-
-       $ git commit --amend -s -a
-
-#. Update the versions of the images that are pulled into the CI VMs.
-
-* Open a PR against the :ref:`packer_ci` with an update to said image versions. Once your PR is merged, a new version of the VM will be ready for consumption in the CI.
-* Update the ``SERVER_VERSION``  field in ``test/Vagrantfile`` to contain the new version, which is the build number from the `Jenkins Job for the VMs <https://jenkins.cilium.io/job/Vagrant-Master-Boxes-Packer-Build/>`_. For example, build 119 from the pipeline would be the value to set for ``SERVER_VERSION``.
-* Open a pull request with this version change in the cilium repository.
+.. _packer-ci-build: https://github.com/cilium/packer-ci-build/
 
 Nightly Docker image
 ~~~~~~~~~~~~~~~~~~~~

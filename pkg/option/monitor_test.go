@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package option
 
 import (
 	"strconv"
 
-	. "gopkg.in/check.v1"
+	. "github.com/cilium/checkmate"
 )
 
 func (s *OptionSuite) TestVerifyMonitorAggregationLevel(c *C) {

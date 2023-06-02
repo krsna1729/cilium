@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
+
 // Copyright 2019 The Kubernetes Authors.
-// Copyright 2020-2021 Authors of Cilium
 
 package v1
 
@@ -43,6 +44,7 @@ type EndpointSlice struct {
 }
 
 // AddressType represents the type of address referred to by an endpoint.
+// +enum
 type AddressType string
 
 const (
@@ -60,7 +62,8 @@ type Endpoint struct {
 	// according to the corresponding EndpointSlice addressType field. Consumers
 	// must handle different types of addresses in the context of their own
 	// capabilities. This must contain at least one address but no more than
-	// 100.
+	// 100. These are all assumed to be fungible and clients may choose to only
+	// use the first element. Refer to: https://issue.k8s.io/106267
 	// +listType=set
 	Addresses []string `json:"addresses" protobuf:"bytes,1,rep,name=addresses"`
 	// conditions contains information about the current status of the endpoint.
@@ -75,10 +78,16 @@ type Endpoint struct {
 	DeprecatedTopology map[string]string `json:"deprecatedTopology,omitempty" protobuf:"bytes,5,opt,name=deprecatedTopology"`
 
 	// nodeName represents the name of the Node hosting this endpoint. This can
-	// be used to determine endpoints local to a Node. This field can be enabled
-	// with the EndpointSliceNodeName feature gate.
+	// be used to determine endpoints local to a Node.
 	// +optional
 	NodeName *string `json:"nodeName,omitempty" protobuf:"bytes,6,opt,name=nodeName"`
+	// zone is the name of the Zone this endpoint exists in.
+	// +optional
+	Zone *string `json:"zone,omitempty" protobuf:"bytes,7,opt,name=zone"`
+	// hints contains information associated with how an endpoint should be
+	// consumed.
+	// +optional
+	Hints *EndpointHints `json:"hints,omitempty" protobuf:"bytes,8,opt,name=hints"`
 }
 
 // EndpointConditions represents the current condition of an endpoint.
@@ -107,7 +116,22 @@ type EndpointConditions struct {
 	Terminating *bool `json:"terminating,omitempty" protobuf:"bytes,3,name=terminating"`
 }
 
+// EndpointHints provides hints describing how an endpoint should be consumed.
+type EndpointHints struct {
+	// forZones indicates the zone(s) this endpoint should be consumed by to
+	// enable topology aware routing.
+	// +listType=atomic
+	ForZones []ForZone `json:"forZones,omitempty" protobuf:"bytes,1,name=forZones"`
+}
+
+// ForZone provides information about which zones should consume this endpoint.
+type ForZone struct {
+	// name represents the name of the zone.
+	Name string `json:"name" protobuf:"bytes,1,name=name"`
+}
+
 // EndpointPort represents a Port used by an EndpointSlice
+// +structType=atomic
 type EndpointPort struct {
 	// The name of this port. All ports in an EndpointSlice must have a unique
 	// name. If the EndpointSlice is dervied from a Kubernetes service, this

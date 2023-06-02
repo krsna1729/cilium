@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018 Authors of Cilium
+// Copyright Authors of Cilium
 
 package store
 
@@ -57,7 +57,7 @@ type ClusterService struct {
 	// Frontends is a map indexed by the frontend IP address
 	Frontends map[string]PortConfiguration `json:"frontends"`
 
-	// Backends is is map indexed by the backend IP address
+	// Backends is map indexed by the backend IP address
 	Backends map[string]PortConfiguration `json:"backends"`
 
 	// Labels are the labels of the service
@@ -65,6 +65,16 @@ type ClusterService struct {
 
 	// Selector is the label selector used to select backends
 	Selector map[string]string `json:"selector"`
+
+	// IncludeExternal is true when external endpoints from other clusters
+	// should be included
+	IncludeExternal bool `json:"includeExternal"`
+
+	// Shared is true when the service should be exposed/shared to other clusters
+	Shared bool `json:"shared"`
+
+	// ClusterID is the cluster ID the service is configured in
+	ClusterID uint32 `json:"clusterID"`
 }
 
 func (s *ClusterService) String() string {
@@ -94,7 +104,7 @@ func (s *ClusterService) Marshal() ([]byte, error) {
 }
 
 // Unmarshal parses the JSON byte slice and updates the global service receiver
-func (s *ClusterService) Unmarshal(data []byte) error {
+func (s *ClusterService) Unmarshal(_ string, data []byte) error {
 	newService := NewClusterService("", "")
 
 	if err := json.Unmarshal(data, &newService); err != nil {

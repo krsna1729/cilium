@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2018 Authors of Cilium
+// Copyright Authors of Cilium
 
 package kvstore
 
@@ -38,9 +38,18 @@ const (
 	// fieldNumEntries is the number of entries in the result
 	fieldNumEntries = "numEntries"
 
+	// fieldRemainingEntries is the number of entries still to be retrieved
+	fieldRemainingEntries = "remainingEntries"
+
 	// fieldAttachLease is true if the key must be attached to a lease
 	fieldAttachLease = "attachLease"
 
 	// fieldEtcdEndpoint is the etcd endpoint we talk to
 	fieldEtcdEndpoint = "etcdEndpoint"
+
+	// FieldUser identifies a user in the kvstore
+	FieldUser = logfields.User
+
+	// FieldRole identifies a role in the kvstore
+	FieldRole = "role"
 )

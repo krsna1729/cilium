@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019 Authors of Cilium
+// Copyright Authors of Cilium
 
 package linux_defaults
 
 import (
-	"time"
+	"golang.org/x/sys/unix"
 )
 
 // Linux specific constants used in Linux datapath
@@ -15,6 +15,16 @@ const (
 	// RouteTableWireguard is the default table ID to use for Wireguard routing
 	// rules
 	RouteTableWireguard = 201
+
+	// RouteTableVtep is the default table ID to use for VTEP routing rules
+	RouteTableVtep = 202
+
+	// RouteTableEgressGatewayInterfacesOffset is the offset for the per-ENI
+	// egress gateway routing tables.
+	// Each ENI interface will have its own table starting with this offset. It
+	// is 300 because it is highly unlikely to collide with the main routing
+	// table which is between 253-255. See ip-route(8).
+	RouteTableEgressGatewayInterfacesOffset = 300
 
 	// RouteTableInterfacesOffset is the offset for the per-ENI routing tables.
 	// Each ENI interface will have its own table starting with this offset. It
@@ -51,16 +61,26 @@ const (
 	// RouterMarkNodePort
 	MaskMultinodeNodeport = 0x80
 
-	// IPSecProtocolID IP protocol ID for IPSec defined in RFC4303
-	RouteProtocolIPSec = 50
+	// RTProto is the default protocol we install our fib rules and routes with
+	RTProto = unix.RTPROT_KERNEL
 
 	// RulePriorityWireguard is the priority of the rule used for routing packets to Wireguard device for encryption
 	RulePriorityWireguard = 1
+
+	// RulePriorityEgressGateway is the priority used in IP routes added by the manager.
+	// This value was picked as it's lower than the ones used by Cilium
+	// (RulePriorityEgressv2 = 111) or the AWS CNI (10) to install the IP
+	// rules for routing EP traffic to the correct ENI interface
+	RulePriorityEgressGateway = 8
 
 	// RulePriorityIngress is the priority of the rule used for ingress routing
 	// of endpoints. This priority is after encryption and proxy rules, and
 	// before the local table priority.
 	RulePriorityIngress = 20
+
+	// RulePriorityLocalLookup is the priority for the local lookup rule which is
+	// moved on init from 0
+	RulePriorityLocalLookup = 100
 
 	// RulePriorityEgress is the priority of the rule used for egress routing
 	// of endpoints. This priority is after the local table priority.
@@ -81,22 +101,25 @@ const (
 	// This priority is before the egress priority.
 	RulePriorityNodeport = RulePriorityEgress - 1
 
-	// TunnelDeviceName the default name of the tunnel device when using vxlan
-	TunnelDeviceName = "cilium_vxlan"
+	// RulePriorityVtep is the priority of the rule used for routing packets to VTEP device
+	RulePriorityVtep = 112
 
 	// IPSec offset value for node rules
 	IPsecMaxKeyVersion = 15
 
-	// IPsecMarkMask is the mask required for the IPsec SPI and encrypt/decrypt bits
-	IPsecMarkMask = 0xFF00
+	// IPsecMarkMaskNodeID is the mask used for the node ID.
+	IPsecMarkMaskNodeID = 0xFFFF0000
+
+	// IPsecOldMarkMaskOut is the mask that was previously used. It can be
+	// removed in Cilium v1.15.
+	IPsecOldMarkMaskOut = 0xFF00
+
+	// IPsecMarkMask is the mask required for the IPsec SPI, node ID, and encrypt/decrypt bits
+	IPsecMarkMaskOut = IPsecOldMarkMaskOut | IPsecMarkMaskNodeID
 
 	// IPsecMarkMaskIn is the mask required for IPsec to lookup encrypt/decrypt bits
 	IPsecMarkMaskIn = 0x0F00
 
 	// IPsecFwdPriority is the priority of the fwd rules placed by IPsec
 	IPsecFwdPriority = 0x0B9F
-
-	// IPsecKeyDeleteDelay is the time to wait before removing old keys when
-	// the IPsec key is changing.
-	IPsecKeyDeleteDelay = 5 * time.Minute
 )

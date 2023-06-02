@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2017 Authors of Cilium
+// Copyright Authors of Cilium
 
 package RuntimeTest
 
@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
+	. "github.com/onsi/gomega"
+
 	. "github.com/cilium/cilium/test/ginkgo-ext"
 	"github.com/cilium/cilium/test/helpers"
-
-	. "github.com/onsi/gomega"
 )
 
 const (
@@ -25,7 +25,7 @@ const (
 	MonitorTraceNotification = "TraceNotification"
 )
 
-var _ = Describe("RuntimeMonitorTest", func() {
+var _ = Describe("RuntimeDatapathMonitorTest", func() {
 
 	var (
 		vm            *helpers.SSHMeta
@@ -100,27 +100,6 @@ var _ = Describe("RuntimeMonitorTest", func() {
 				MonitorDropNotification, MonitorTraceNotification))
 			ExpectWithOffset(1, res.WasSuccessful()).To(BeTrue(), "cannot update monitor config")
 		}
-
-		It("Cilium monitor verbose mode", func() {
-			monitorConfig()
-
-			ctx, cancel := context.WithCancel(context.Background())
-			res := vm.ExecInBackground(ctx, "cilium monitor -vv")
-			defer cancel()
-
-			Expect(vm.WaitEndpointsReady()).Should(BeTrue(), "Endpoints are not ready after timeout")
-
-			endpoints, err := vm.GetEndpointsIds()
-			Expect(err).Should(BeNil())
-
-			for k, v := range endpoints {
-				filter := fmt.Sprintf("FROM %s DEBUG:", v)
-				vm.ContainerExec(k, helpers.Ping(helpers.Httpd1))
-				Expect(res.WaitUntilMatch(filter)).To(BeNil(),
-					"%q is not in the output after timeout", filter)
-				Expect(res.Stdout()).Should(ContainSubstring(filter))
-			}
-		})
 
 		It("Cilium monitor event types", func() {
 			monitorConfig()

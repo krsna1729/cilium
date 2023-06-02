@@ -1,34 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2021 Authors of Cilium
+// Copyright Authors of Cilium
 
 package manager
 
 import (
 	"context"
-	"math"
 	"net"
+	"net/netip"
 	"time"
 
+	"github.com/cilium/workerpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/exp/slices"
+
+	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/controller"
-	"github.com/cilium/cilium/pkg/datapath"
 	"github.com/cilium/cilium/pkg/datapath/iptables"
+	datapath "github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/inctimer"
+	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
+	ipcacheTypes "github.com/cilium/cilium/pkg/ipcache/types"
+	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/node/addressing"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/rand"
 	"github.com/cilium/cilium/pkg/source"
-
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
-	baseBackgroundSyncInterval = time.Minute
 	randGen                    = rand.NewSafeRand(time.Now().UnixNano())
+	baseBackgroundSyncInterval = time.Minute
+)
+
+const (
+	numBackgroundWorkers = 1
 )
 
 type nodeEntry struct {
@@ -46,8 +58,11 @@ type nodeEntry struct {
 
 // IPCache is the set of interactions the node manager performs with the ipcache
 type IPCache interface {
-	Upsert(ip string, hostIP net.IP, hostKey uint8, k8sMeta *ipcache.K8sMetadata, newIdentity ipcache.Identity) (bool, error)
-	Delete(IP string, source source.Source) bool
+	GetMetadataByPrefix(prefix netip.Prefix) ipcache.PrefixInfo
+	UpsertMetadata(prefix netip.Prefix, src source.Source, resource ipcacheTypes.ResourceID, aux ...ipcache.IPMetadata)
+	OverrideIdentity(prefix netip.Prefix, identityLabels labels.Labels, src source.Source, resource ipcacheTypes.ResourceID)
+	RemoveMetadata(prefix netip.Prefix, resource ipcacheTypes.ResourceID, aux ...ipcache.IPMetadata)
+	RemoveIdentityOverride(prefix netip.Prefix, identityLabels labels.Labels, resource ipcacheTypes.ResourceID)
 }
 
 // Configuration is the set of configuration options the node manager depends
@@ -59,23 +74,10 @@ type Configuration interface {
 	EncryptionEnabled() bool
 }
 
-// Notifier is the interface the wraps Subscribe and Unsubscribe. An
-// implementation of this interface notifies subscribers of nodes being added,
-// updated or deleted.
-type Notifier interface {
-	// Subscribe adds the given NodeHandler to the list of subscribers that are
-	// notified of node changes. Upon call to this method, the NodeHandler is
-	// being notified of all nodes that are already in the cluster by calling
-	// the NodeHandler's NodeAdd callback.
-	Subscribe(datapath.NodeHandler)
-	// Unsubscribe removes the given NodeHandler from the list of subscribers.
-	Unsubscribe(datapath.NodeHandler)
-}
+var _ Notifier = (*manager)(nil)
 
-var _ Notifier = (*Manager)(nil)
-
-// Manager is the entity that manages a collection of nodes
-type Manager struct {
+// manager is the entity that manages a collection of nodes
+type manager struct {
 	// mutex is the lock protecting access to the nodes map. The mutex must
 	// be held for any access of the nodes map.
 	//
@@ -104,8 +106,8 @@ type Manager struct {
 	// events.
 	nodeHandlers map[datapath.NodeHandler]struct{}
 
-	// closeChan is closed when the manager is closed
-	closeChan chan struct{}
+	// workerpool manages background workers
+	workerpool *workerpool.WorkerPool
 
 	// name is the name of the manager. It must be unique and feasibility
 	// to be used a prometheus metric name.
@@ -129,10 +131,14 @@ type Manager struct {
 
 	// ipcache is the set operations performed against the ipcache
 	ipcache IPCache
+
+	// controllerManager manages the controllers that are launched within the
+	// Manager.
+	controllerManager *controller.Manager
 }
 
 // Subscribe subscribes the given node handler to node events.
-func (m *Manager) Subscribe(nh datapath.NodeHandler) {
+func (m *manager) Subscribe(nh datapath.NodeHandler) {
 	m.nodeHandlersMu.Lock()
 	m.nodeHandlers[nh] = struct{}{}
 	m.nodeHandlersMu.Unlock()
@@ -147,14 +153,14 @@ func (m *Manager) Subscribe(nh datapath.NodeHandler) {
 }
 
 // Unsubscribe unsubscribes the given node handler with node events.
-func (m *Manager) Unsubscribe(nh datapath.NodeHandler) {
+func (m *manager) Unsubscribe(nh datapath.NodeHandler) {
 	m.nodeHandlersMu.Lock()
 	delete(m.nodeHandlers, nh)
 	m.nodeHandlersMu.Unlock()
 }
 
 // Iter executes the given function in all subscribed node handlers.
-func (m *Manager) Iter(f func(nh datapath.NodeHandler)) {
+func (m *manager) Iter(f func(nh datapath.NodeHandler)) {
 	m.nodeHandlersMu.RLock()
 	defer m.nodeHandlersMu.RUnlock()
 
@@ -163,17 +169,16 @@ func (m *Manager) Iter(f func(nh datapath.NodeHandler)) {
 	}
 }
 
-// NewManager returns a new node manager
-func NewManager(name string, dp datapath.NodeHandler, ipcache IPCache, c Configuration) (*Manager, error) {
-	m := &Manager{
-		name:         name,
-		nodes:        map[nodeTypes.Identity]*nodeEntry{},
-		conf:         c,
-		ipcache:      ipcache,
-		nodeHandlers: map[datapath.NodeHandler]struct{}{},
-		closeChan:    make(chan struct{}),
+// New returns a new node manager
+func New(name string, c Configuration, ipCache IPCache) (*manager, error) {
+	m := &manager{
+		name:              name,
+		nodes:             map[nodeTypes.Identity]*nodeEntry{},
+		conf:              c,
+		controllerManager: controller.NewManager(),
+		nodeHandlers:      map[datapath.NodeHandler]struct{}{},
+		ipcache:           ipCache,
 	}
-	m.Subscribe(dp)
 
 	m.metricEventsReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metrics.Namespace,
@@ -201,30 +206,30 @@ func NewManager(name string, dp datapath.NodeHandler, ipcache IPCache, c Configu
 		return nil, err
 	}
 
-	go m.backgroundSync()
-
 	return m, nil
 }
 
-// Close shuts down a node manager
-func (m *Manager) Close() {
+func (m *manager) Start(hive.HookContext) error {
+	m.workerpool = workerpool.New(numBackgroundWorkers)
+	return m.workerpool.Submit("backgroundSync", m.backgroundSync)
+}
+
+// Stop shuts down a node manager
+func (m *manager) Stop(hive.HookContext) error {
+	if m.workerpool != nil {
+		if err := m.workerpool.Close(); err != nil {
+			return err
+		}
+	}
+
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-
-	close(m.closeChan)
 
 	metrics.Unregister(m.metricNumNodes)
 	metrics.Unregister(m.metricEventsReceived)
 	metrics.Unregister(m.metricDatapathValidations)
 
-	// delete all nodes to clean up the datapath for each node
-	for _, n := range m.nodes {
-		n.mutex.Lock()
-		m.Iter(func(nh datapath.NodeHandler) {
-			nh.NodeDelete(n.node)
-		})
-		n.mutex.Unlock()
-	}
+	return nil
 }
 
 // ClusterSizeDependantInterval returns a time.Duration that is dependant on
@@ -251,27 +256,21 @@ func (m *Manager) Close() {
 // 4096  | 8m19.080616652s
 // 8192  | 9m00.662124608s
 // 16384 | 9m42.247293667s
-func (m *Manager) ClusterSizeDependantInterval(baseInterval time.Duration) time.Duration {
+func (m *manager) ClusterSizeDependantInterval(baseInterval time.Duration) time.Duration {
 	m.mutex.RLock()
 	numNodes := len(m.nodes)
 	m.mutex.RUnlock()
 
-	// no nodes are being managed, no work will be performed, return
-	// baseInterval to check again in a reasonable timeframe
-	if numNodes == 0 {
-		return baseInterval
-	}
-
-	waitNanoseconds := float64(baseInterval.Nanoseconds()) * math.Log1p(float64(numNodes))
-	return time.Duration(int64(waitNanoseconds))
-
+	return backoff.ClusterSizeDependantInterval(baseInterval, numNodes)
 }
 
-func (m *Manager) backgroundSyncInterval() time.Duration {
+func (m *manager) backgroundSyncInterval() time.Duration {
 	return m.ClusterSizeDependantInterval(baseBackgroundSyncInterval)
 }
 
-func (m *Manager) backgroundSync() {
+// backgroundSync ensures that local node has a valid datapath in-place for
+// each node in the cluster. See NodeValidateImplementation().
+func (m *manager) backgroundSync(ctx context.Context) error {
 	syncTimer, syncTimerDone := inctimer.New()
 	defer syncTimerDone()
 	for {
@@ -302,8 +301,8 @@ func (m *Manager) backgroundSync() {
 		}
 
 		select {
-		case <-m.closeChan:
-			return
+		case <-ctx.Done():
+			return nil
 		case <-syncTimer.After(syncInterval):
 		}
 	}
@@ -311,7 +310,7 @@ func (m *Manager) backgroundSync() {
 
 // legacyNodeIpBehavior returns true if the agent is still running in legacy
 // mode regarding node IPs
-func (m *Manager) legacyNodeIpBehavior() bool {
+func (m *manager) legacyNodeIpBehavior() bool {
 	// Cilium < 1.7 only exposed the Cilium internalIP to the ipcache
 	// unless encryption was enabled. This meant that for the majority of
 	// node IPs, CIDR policy rules would apply. With the introduction of
@@ -326,111 +325,168 @@ func (m *Manager) legacyNodeIpBehavior() bool {
 	if m.conf.NodeEncryptionEnabled() {
 		return false
 	}
-	// Needed to store the SPI for pod->remote node in the ipcache since
-	// that path goes through the tunnel.
+	// Needed to store the tunnel endpoint for pod->remote node in the
+	// ipcache so that this traffic goes through the tunnel.
 	if m.conf.EncryptionEnabled() && m.conf.TunnelingEnabled() {
 		return false
 	}
 	return true
 }
 
+func (m *manager) nodeAddressHasTunnelIP(address nodeTypes.Address) bool {
+	// If the host firewall is enabled, all traffic to remote nodes must go
+	// through the tunnel to preserve the source identity as part of the
+	// encapsulation. In encryption case we also want to use vxlan device
+	// to create symmetric traffic when sending nodeIP->pod and pod->nodeIP.
+	return address.Type == addressing.NodeCiliumInternalIP || m.conf.EncryptionEnabled() ||
+		option.Config.EnableHostFirewall || option.Config.JoinCluster
+}
+
+func (m *manager) nodeAddressHasEncryptKey(address nodeTypes.Address) bool {
+	// If we are doing encryption, but not node based encryption, then do not
+	// add a key to the nodeIPs so that we avoid a trip through stack and attempting
+	// to encrypt something we know does not have an encryption policy installed
+	// in the datapath. By setting key=0 and tunnelIP this will result in traffic
+	// being sent unencrypted over overlay device.
+	return m.conf.NodeEncryptionEnabled() &&
+		// Also ignore any remote node's key if the local node opted to not perform
+		// node-to-node encryption
+		!node.GetOptOutNodeEncryption()
+}
+
+func (m *manager) nodeAddressSkipsIPCache(address nodeTypes.Address) bool {
+	return m.legacyNodeIpBehavior() && address.Type != addressing.NodeCiliumInternalIP
+}
+
+func (m *manager) nodeIdentityLabels(n nodeTypes.Node) (nodeLabels labels.Labels, hasOverride bool) {
+	nodeLabels = labels.NewFrom(labels.LabelRemoteNode)
+	if m.conf.RemoteNodeIdentitiesEnabled() {
+		if n.IsLocal() {
+			nodeLabels = labels.NewFrom(labels.LabelHost)
+		} else if !identity.NumericIdentity(n.NodeIdentity).IsReservedIdentity() {
+			// This needs to match clustermesh-apiserver's VMManager.AllocateNodeIdentity
+			nodeLabels = labels.Map2Labels(n.Labels, labels.LabelSourceK8s)
+			hasOverride = true
+		}
+	} else {
+		nodeLabels = labels.NewFrom(labels.LabelHost)
+	}
+	return nodeLabels, hasOverride
+}
+
 // NodeUpdated is called after the information of a node has been updated. The
 // node in the manager is added or updated if the source is allowed to update
 // the node. If an update or addition has occurred, NodeUpdate() of the datapath
 // interface is invoked.
-func (m *Manager) NodeUpdated(n nodeTypes.Node) {
+func (m *manager) NodeUpdated(n nodeTypes.Node) {
 	log.Debugf("Received node update event from %s: %#v", n.Source, n)
-	nodeIdentity := n.Identity()
+
+	nodeIdentifier := n.Identity()
 	dpUpdate := true
-	nodeIP := n.GetNodeIP(false)
+	var nodeIP netip.Addr
+	if nIP := n.GetNodeIP(false); nIP != nil {
+		// GH-24829: Support IPv6-only nodes.
 
-	remoteHostIdentity := identity.ReservedIdentityHost
-	if m.conf.RemoteNodeIdentitiesEnabled() {
-		nid := identity.NumericIdentity(n.NodeIdentity)
-		if nid != identity.IdentityUnknown {
-			remoteHostIdentity = nid
-		} else if n.Source != source.Local {
-			remoteHostIdentity = identity.ReservedIdentityRemoteNode
-		}
+		// Skip returning the error here because at this level, we assume that
+		// the IP is valid as long as it's coming from nodeTypes.Node. This
+		// object is created either from the node discovery (K8s) or from an
+		// event from the kvstore.
+		nodeIP, _ = ip.AddrFromIP(nIP)
 	}
 
-	var ipsAdded, healthIPsAdded []string
+	resource := ipcacheTypes.NewResourceID(ipcacheTypes.ResourceKindNode, "", n.Name)
+	nodeLabels, nodeIdentityOverride := m.nodeIdentityLabels(n)
 
-	// helper function with the required logic to skip IPCache interactions
-	skipIPCache := func(address nodeTypes.Address) bool {
-		return m.legacyNodeIpBehavior() && address.Type != addressing.NodeCiliumInternalIP
-	}
+	var nodeIPsAdded, healthIPsAdded, ingressIPsAdded []netip.Prefix
 
 	for _, address := range n.IPAddresses {
-		var tunnelIP net.IP
-		key := n.EncryptionKey
-
-		// If the host firewall is enabled, all traffic to remote nodes must go
-		// through the tunnel to preserve the source identity as part of the
-		// encapsulation. In encryption case we also want to use vxlan device
-		// to create symmetric traffic when sending nodeIP->pod and pod->nodeIP.
-		if address.Type == addressing.NodeCiliumInternalIP || m.conf.EncryptionEnabled() ||
-			option.Config.EnableHostFirewall || option.Config.JoinCluster {
-			tunnelIP = nodeIP
-		}
-
-		if address.Type != addressing.NodeCiliumInternalIP {
+		if option.Config.NodeIpsetNeeded() && address.Type == addressing.NodeInternalIP {
 			iptables.AddToNodeIpset(address.IP)
 		}
 
-		if skipIPCache(address) {
+		if m.nodeAddressSkipsIPCache(address) {
 			continue
 		}
 
-		// If we are doing encryption, but not node based encryption, then do not
-		// add a key to the nodeIPs so that we avoid a trip through stack and attempting
-		// to encrypt something we know does not have an encryption policy installed
-		// in the datapath. By setting key=0 and tunnelIP this will result in traffic
-		// being sent unencrypted over overlay device.
-		if !m.conf.NodeEncryptionEnabled() &&
-			(address.Type == addressing.NodeExternalIP || address.Type == addressing.NodeInternalIP) {
-			key = 0
+		var tunnelIP netip.Addr
+		if m.nodeAddressHasTunnelIP(address) {
+			tunnelIP = nodeIP
 		}
 
-		ipAddrStr := address.IP.String()
-		_, err := m.ipcache.Upsert(ipAddrStr, tunnelIP, key, nil, ipcache.Identity{
-			ID:     remoteHostIdentity,
-			Source: n.Source,
-		})
+		var key uint8
+		if m.nodeAddressHasEncryptKey(address) {
+			key = n.EncryptionKey
+		}
 
-		// Upsert() will return true if the ipcache entry is owned by
-		// the source of the node update that triggered this node
-		// update (kvstore, k8s, ...) The datapath is only updated if
-		// that source of truth is updated.
-		if err != nil {
+		prefix := ip.IPToNetPrefix(address.IP)
+		// We expect the node manager to have a source of either Kubernetes,
+		// CustomResource, or KVStore. Prioritize the KVStore source over the
+		// rest as it is the strongest source, i.e. only trigger datapath
+		// updates if the information we receive takes priority.
+		//
+		// The only exception are kube-apiserver entries. In that case,
+		// we still want to inform subscribers about changes in auxiliary
+		// data such as for example the health endpoint.
+		existing := m.ipcache.GetMetadataByPrefix(prefix).Source()
+		overwrite := source.AllowOverwrite(existing, n.Source)
+		if !overwrite && existing != source.KubeAPIServer {
 			dpUpdate = false
-		} else {
-			ipsAdded = append(ipsAdded, ipAddrStr)
 		}
+
+		// Always associate the prefix with metadata, even though this may not
+		// end up in an ipcache entry.
+		m.ipcache.UpsertMetadata(prefix, n.Source, resource,
+			nodeLabels,
+			ipcacheTypes.TunnelPeer{Addr: tunnelIP},
+			ipcacheTypes.EncryptKey(key))
+		if nodeIdentityOverride {
+			m.ipcache.OverrideIdentity(prefix, nodeLabels, n.Source, resource)
+		}
+		nodeIPsAdded = append(nodeIPsAdded, prefix)
 	}
 
 	for _, address := range []net.IP{n.IPv4HealthIP, n.IPv6HealthIP} {
-		if address == nil {
+		healthIP := ip.IPToNetPrefix(address)
+		if !healthIP.IsValid() {
 			continue
 		}
-		addrStr := address.String()
-		_, err := m.ipcache.Upsert(addrStr, nodeIP, n.EncryptionKey, nil, ipcache.Identity{
-			ID:     identity.ReservedIdentityHealth,
-			Source: n.Source,
-		})
-		if err != nil {
+		if !source.AllowOverwrite(m.ipcache.GetMetadataByPrefix(healthIP).Source(), n.Source) {
 			dpUpdate = false
-		} else {
-			healthIPsAdded = append(healthIPsAdded, addrStr)
 		}
+
+		m.ipcache.UpsertMetadata(healthIP, n.Source, resource,
+			labels.LabelHealth,
+			ipcacheTypes.TunnelPeer{Addr: nodeIP},
+			ipcacheTypes.EncryptKey(n.EncryptionKey))
+		healthIPsAdded = append(healthIPsAdded, healthIP)
+	}
+
+	for _, address := range []net.IP{n.IPv4IngressIP, n.IPv6IngressIP} {
+		ingressIP := ip.IPToNetPrefix(address)
+		if !ingressIP.IsValid() {
+			continue
+		}
+		if !source.AllowOverwrite(m.ipcache.GetMetadataByPrefix(ingressIP).Source(), n.Source) {
+			dpUpdate = false
+		}
+
+		m.ipcache.UpsertMetadata(ingressIP, n.Source, resource,
+			labels.LabelIngress,
+			ipcacheTypes.TunnelPeer{Addr: nodeIP},
+			ipcacheTypes.EncryptKey(n.EncryptionKey))
+		ingressIPsAdded = append(ingressIPsAdded, ingressIP)
 	}
 
 	m.mutex.Lock()
-	entry, oldNodeExists := m.nodes[nodeIdentity]
+	entry, oldNodeExists := m.nodes[nodeIdentifier]
 	if oldNodeExists {
 		m.metricEventsReceived.WithLabelValues("update", string(n.Source)).Inc()
 
 		if !source.AllowOverwrite(entry.node.Source, n.Source) {
+			// Done; skip node-handler updates and label injection
+			// triggers below. Includes case where the local host
+			// was discovered locally and then is subsequently
+			// updated by the k8s watcher.
 			m.mutex.Unlock()
 			return
 		}
@@ -444,18 +500,8 @@ func (m *Manager) NodeUpdated(n nodeTypes.Node) {
 				nh.NodeUpdate(oldNode, entry.node)
 			})
 		}
-		// Delete the old node IP addresses if they have changed in this node.
-		var oldNodeIPAddrs []net.IP
-		for _, address := range oldNode.IPAddresses {
-			if skipIPCache(address) {
-				continue
-			}
-			oldNodeIPAddrs = append(oldNodeIPAddrs, address.IP)
-		}
-		m.deleteIPCache(oldNode.Source, oldNodeIPAddrs, ipsAdded)
 
-		// Delete the old health IP addresses if they have changed in this node.
-		m.deleteIPCache(oldNode.Source, []net.IP{oldNode.IPv4HealthIP, oldNode.IPv6HealthIP}, healthIPsAdded)
+		m.removeNodeFromIPCache(oldNode, resource, nodeIPsAdded, healthIPsAdded, ingressIPsAdded)
 
 		entry.mutex.Unlock()
 	} else {
@@ -464,7 +510,7 @@ func (m *Manager) NodeUpdated(n nodeTypes.Node) {
 
 		entry = &nodeEntry{node: n}
 		entry.mutex.Lock()
-		m.nodes[nodeIdentity] = entry
+		m.nodes[nodeIdentifier] = entry
 		m.mutex.Unlock()
 		if dpUpdate {
 			m.Iter(func(nh datapath.NodeHandler) {
@@ -475,26 +521,78 @@ func (m *Manager) NodeUpdated(n nodeTypes.Node) {
 	}
 }
 
-// deleteIPCache deletes the IP addresses from the IPCache with the 'oldSource'
-// if they are not found in the newIPs slice.
-func (m *Manager) deleteIPCache(oldSource source.Source, oldIPs []net.IP, newIPs []string) {
-	for _, address := range oldIPs {
-		if address == nil {
+// removeNodeFromIPCache removes all addresses associated with oldNode from the IPCache,
+// unless they are present in the nodeIPsAdded, healthIPsAdded, ingressIPsAdded lists.
+//
+// The removal logic in this function should mirror the upsert logic in NodeUpdated.
+func (m *manager) removeNodeFromIPCache(oldNode nodeTypes.Node, resource ipcacheTypes.ResourceID,
+	nodeIPsAdded, healthIPsAdded, ingressIPsAdded []netip.Prefix) {
+
+	var oldNodeIP netip.Addr
+	if nIP := oldNode.GetNodeIP(false); nIP != nil {
+		// See comment in NodeUpdated().
+		oldNodeIP, _ = ip.AddrFromIP(nIP)
+	}
+	oldNodeLabels, oldNodeIdentityOverride := m.nodeIdentityLabels(oldNode)
+
+	// Delete the old node IP addresses if they have changed in this node.
+	for _, address := range oldNode.IPAddresses {
+		oldPrefix := ip.IPToNetPrefix(address.IP)
+		if slices.Contains(nodeIPsAdded, oldPrefix) {
 			continue
 		}
-		addrStr := address.String()
-		var found bool
-		for _, ipAdded := range newIPs {
-			if ipAdded == addrStr {
-				found = true
-				break
-			}
+
+		if option.Config.NodeIpsetNeeded() && address.Type == addressing.NodeInternalIP {
+			iptables.RemoveFromNodeIpset(address.IP)
 		}
-		// Delete from the IPCache if the node's IP addresses was not
-		// added in this update.
-		if !found {
-			m.ipcache.Delete(addrStr, oldSource)
+
+		if m.nodeAddressSkipsIPCache(address) {
+			continue
 		}
+
+		var oldTunnelIP netip.Addr
+		if m.nodeAddressHasTunnelIP(address) {
+			oldTunnelIP = oldNodeIP
+		}
+
+		var oldKey uint8
+		if m.nodeAddressHasEncryptKey(address) {
+			oldKey = oldNode.EncryptionKey
+		}
+
+		m.ipcache.RemoveMetadata(oldPrefix, resource,
+			oldNodeLabels,
+			ipcacheTypes.TunnelPeer{Addr: oldTunnelIP},
+			ipcacheTypes.EncryptKey(oldKey))
+		if oldNodeIdentityOverride {
+			m.ipcache.RemoveIdentityOverride(oldPrefix, oldNodeLabels, resource)
+		}
+	}
+
+	// Delete the old health IP addresses if they have changed in this node.
+	for _, address := range []net.IP{oldNode.IPv4HealthIP, oldNode.IPv6HealthIP} {
+		healthIP := ip.IPToNetPrefix(address)
+		if !healthIP.IsValid() || slices.Contains(healthIPsAdded, healthIP) {
+			continue
+		}
+
+		m.ipcache.RemoveMetadata(healthIP, resource,
+			labels.LabelHealth,
+			ipcacheTypes.TunnelPeer{Addr: oldNodeIP},
+			ipcacheTypes.EncryptKey(oldNode.EncryptionKey))
+	}
+
+	// Delete the old ingress IP addresses if they have changed in this node.
+	for _, address := range []net.IP{oldNode.IPv4IngressIP, oldNode.IPv6IngressIP} {
+		ingressIP := ip.IPToNetPrefix(address)
+		if !ingressIP.IsValid() || slices.Contains(ingressIPsAdded, ingressIP) {
+			continue
+		}
+
+		m.ipcache.RemoveMetadata(ingressIP, resource,
+			labels.LabelIngress,
+			ipcacheTypes.TunnelPeer{Addr: oldNodeIP},
+			ipcacheTypes.EncryptKey(oldNode.EncryptionKey))
 	}
 }
 
@@ -502,19 +600,21 @@ func (m *Manager) deleteIPCache(oldSource source.Source, oldIPs []net.IP, newIPs
 // from the manager if the node is still owned by the source of which the event
 // origins from. If the node was removed, NodeDelete() is invoked of the
 // datapath interface.
-func (m *Manager) NodeDeleted(n nodeTypes.Node) {
+func (m *manager) NodeDeleted(n nodeTypes.Node) {
 	m.metricEventsReceived.WithLabelValues("delete", string(n.Source)).Inc()
 
 	log.Debugf("Received node delete event from %s", n.Source)
 
-	nodeIdentity := n.Identity()
+	nodeIdentifier := n.Identity()
 
 	m.mutex.Lock()
-	entry, oldNodeExists := m.nodes[nodeIdentity]
+	entry, oldNodeExists := m.nodes[nodeIdentifier]
 	if !oldNodeExists {
 		m.mutex.Unlock()
 		return
 	}
+
+	resource := ipcacheTypes.NewResourceID(ipcacheTypes.ResourceKindNode, "", n.Name)
 
 	// If the source is Kubernetes and the node is the node we are running on
 	// Kubernetes is giving us a hint it is about to delete our node. Close down
@@ -523,7 +623,7 @@ func (m *Manager) NodeDeleted(n nodeTypes.Node) {
 		m.mutex.Unlock()
 		if n.IsLocal() && n.Source == source.Kubernetes {
 			log.Debugf("Kubernetes is deleting local node, close manager")
-			m.Close()
+			m.Stop(context.Background())
 		} else {
 			log.Debugf("Ignoring delete event of node %s from source %s. The node is owned by %s",
 				n.Name, n.Source, entry.node.Source)
@@ -531,28 +631,12 @@ func (m *Manager) NodeDeleted(n nodeTypes.Node) {
 		return
 	}
 
-	for _, address := range entry.node.IPAddresses {
-		if address.Type != addressing.NodeCiliumInternalIP {
-			iptables.RemoveFromNodeIpset(address.IP)
-		}
-
-		if m.legacyNodeIpBehavior() && address.Type != addressing.NodeCiliumInternalIP {
-			continue
-		}
-
-		m.ipcache.Delete(address.IP.String(), n.Source)
-	}
-
-	for _, address := range []net.IP{entry.node.IPv4HealthIP, entry.node.IPv6HealthIP} {
-		if address != nil {
-			m.ipcache.Delete(address.String(), n.Source)
-		}
-	}
+	m.removeNodeFromIPCache(entry.node, resource, nil, nil, nil)
 
 	m.metricNumNodes.Dec()
 
 	entry.mutex.Lock()
-	delete(m.nodes, nodeIdentity)
+	delete(m.nodes, nodeIdentifier)
 	m.mutex.Unlock()
 	m.Iter(func(nh datapath.NodeHandler) {
 		nh.NodeDelete(n)
@@ -562,7 +646,7 @@ func (m *Manager) NodeDeleted(n nodeTypes.Node) {
 
 // GetNodeIdentities returns a list of all node identities store in node
 // manager.
-func (m *Manager) GetNodeIdentities() []nodeTypes.Identity {
+func (m *manager) GetNodeIdentities() []nodeTypes.Identity {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -575,7 +659,7 @@ func (m *Manager) GetNodeIdentities() []nodeTypes.Identity {
 }
 
 // GetNodes returns a copy of all of the nodes as a map from Identity to Node.
-func (m *Manager) GetNodes() map[nodeTypes.Identity]nodeTypes.Node {
+func (m *manager) GetNodes() map[nodeTypes.Identity]nodeTypes.Node {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -591,12 +675,12 @@ func (m *Manager) GetNodes() map[nodeTypes.Identity]nodeTypes.Node {
 
 // StartNeighborRefresh spawns a controller which refreshes neighbor table
 // by sending arping periodically.
-func (m *Manager) StartNeighborRefresh(nh datapath.NodeHandler) {
+func (m *manager) StartNeighborRefresh(nh datapath.NodeNeighbors) {
 	ctx, cancel := context.WithCancel(context.Background())
 	controller.NewManager().UpdateController("neighbor-table-refresh",
 		controller.ControllerParams{
 			DoFunc: func(controllerCtx context.Context) error {
-				// Cancel previous go routines from previous controller run
+				// Cancel previous goroutines from previous controller run
 				cancel()
 				ctx, cancel = context.WithCancel(controllerCtx)
 				m.mutex.RLock()

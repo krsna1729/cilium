@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package ipam
 
@@ -7,15 +7,20 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/cilium/cilium/pkg/azure/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/ipam"
+	"github.com/cilium/cilium/pkg/ipam/stats"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/math"
-
-	"github.com/sirupsen/logrus"
 )
+
+type ipamNodeActions interface {
+	InstanceID() string
+}
 
 // Node represents a node representing an Azure instance
 type Node struct {
@@ -23,7 +28,7 @@ type Node struct {
 	k8sObj *v2.CiliumNode
 
 	// node contains the general purpose fields of a node
-	node *ipam.Node
+	node ipamNodeActions
 
 	// manager is the Azure node manager responsible for this node
 	manager *InstancesManager
@@ -72,27 +77,12 @@ func (n *Node) PrepareIPAllocation(scopedLog *logrus.Entry) (a *ipam.AllocationA
 			return fmt.Errorf("invalid interface object")
 		}
 
-		if requiredIfaceName != "" {
-			if iface.Name != requiredIfaceName {
-				scopedLog.WithFields(logrus.Fields{
-					"ifaceName":    iface.Name,
-					"requiredName": requiredIfaceName,
-				}).Debug("Not considering interface for allocation since it does not match the required name")
-				return nil
-			}
-		}
-
-		scopedLog.WithFields(logrus.Fields{
-			"id":           iface.ID,
-			"numAddresses": len(iface.Addresses),
-		}).Debug("Considering interface for allocation")
-
-		availableOnInterface := math.IntMax(types.InterfaceAddressLimit-len(iface.Addresses), 0)
-		if availableOnInterface <= 0 {
+		availableOnInterface, available := isAvailableInterface(requiredIfaceName, iface, scopedLog)
+		if !available {
 			return nil
 		}
 
-		a.AvailableInterfaces++
+		a.InterfaceCandidates++
 
 		if a.InterfaceID == "" {
 			scopedLog.WithFields(logrus.Fields{
@@ -146,17 +136,27 @@ func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationA
 	return 0, "", fmt.Errorf("not implemented")
 }
 
-// ResyncInterfacesAndIPs is called to retrieve and interfaces and IPs as known
+// ResyncInterfacesAndIPs is called to retrieve interfaces and IPs known
 // to the Azure API and return them
-func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *logrus.Entry) (ipamTypes.AllocationMap, error) {
+func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *logrus.Entry) (
+	available ipamTypes.AllocationMap,
+	stats stats.InterfaceStats,
+	err error) {
+
+	// Azure virtual machines always have an upper limit of 256 addresses.
+	// Both VMs and NICs can have a maximum of 256 addresses, so as long as
+	// there is at least one available NIC, we can allocate up to 256 addresses
+	// on the VM (minus the primary IP address).
+	stats.NodeCapacity = math.IntMax(n.GetMaximumAllocatableIPv4()-1, 0)
+
 	if n.node.InstanceID() == "" {
-		return nil, nil
+		return nil, stats, nil
 	}
 
-	available := ipamTypes.AllocationMap{}
+	available = ipamTypes.AllocationMap{}
 	n.manager.mutex.RLock()
 	defer n.manager.mutex.RUnlock()
-	n.manager.instances.ForeachAddress(n.node.InstanceID(), func(instanceID, interfaceID, ip, poolID string, addressObj ipamTypes.Address) error {
+	err = n.manager.instances.ForeachAddress(n.node.InstanceID(), func(instanceID, interfaceID, ip, poolID string, addressObj ipamTypes.Address) error {
 		address, ok := addressObj.(types.AzureAddress)
 		if !ok {
 			scopedLog.WithField("ip", ip).Warning("Not an Azure address object, ignoring IP")
@@ -173,8 +173,28 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *logrus.Ent
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, stats, err
+	}
 
-	return available, nil
+	requiredIfaceName := n.k8sObj.Spec.Azure.InterfaceName
+	err = n.manager.instances.ForeachInterface(n.node.InstanceID(), func(instanceID, interfaceID string, interfaceObj ipamTypes.InterfaceRevision) error {
+		iface, ok := interfaceObj.Resource.(*types.AzureInterface)
+		if !ok {
+			return fmt.Errorf("invalid interface object")
+		}
+
+		_, available := isAvailableInterface(requiredIfaceName, iface, scopedLog)
+		if available {
+			stats.RemainingAvailableInterfaceCount++
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, stats, err
+	}
+
+	return available, stats, nil
 }
 
 // GetMaximumAllocatableIPv4 returns the maximum amount of IPv4 addresses
@@ -189,4 +209,39 @@ func (n *Node) GetMaximumAllocatableIPv4() int {
 // must be allocated to the instance.
 func (n *Node) GetMinimumAllocatableIPv4() int {
 	return defaults.IPAMPreAllocation
+}
+
+func (n *Node) IsPrefixDelegated() bool {
+	return false
+}
+
+func (n *Node) GetUsedIPWithPrefixes() int {
+	if n.k8sObj == nil {
+		return 0
+	}
+	return len(n.k8sObj.Status.IPAM.Used)
+}
+
+// isAvailableInterface returns whether interface is available and the number of available IPs to allocate in interface
+func isAvailableInterface(requiredIfaceName string, iface *types.AzureInterface, scopedLog *logrus.Entry) (availableOnInterface int, available bool) {
+	if requiredIfaceName != "" {
+		if iface.Name != requiredIfaceName {
+			scopedLog.WithFields(logrus.Fields{
+				"ifaceName":    iface.Name,
+				"requiredName": requiredIfaceName,
+			}).Debug("Not considering interface as available since it does not match the required name")
+			return 0, false
+		}
+	}
+
+	scopedLog.WithFields(logrus.Fields{
+		"id":           iface.ID,
+		"numAddresses": len(iface.Addresses),
+	}).Debug("Considering interface as available")
+
+	availableOnInterface = math.IntMax(types.InterfaceAddressLimit-len(iface.Addresses), 0)
+	if availableOnInterface <= 0 {
+		return 0, false
+	}
+	return availableOnInterface, true
 }

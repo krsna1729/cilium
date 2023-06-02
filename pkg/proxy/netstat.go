@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018 Authors of Cilium
+// Copyright Authors of Cilium
 
 package proxy
 
@@ -64,4 +64,9 @@ func readOpenLocalPorts(procNetFiles []string) map[uint16]struct{} {
 	}
 
 	return openLocalPorts
+}
+
+// OpenLocalPorts returns the set of L4 ports currently open locally.
+func OpenLocalPorts() map[uint16]struct{} {
+	return readOpenLocalPorts(append(procNetTCPFiles, procNetUDPFiles...))
 }

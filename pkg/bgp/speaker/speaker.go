@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of Cilium
+// Copyright Authors of Cilium
 
 // Package speaker abstracts the BGP speaker controller from MetalLB. This
 // package provides BGP announcements based on K8s object event handling.
@@ -10,19 +10,22 @@ import (
 	"errors"
 	"sync/atomic"
 
+	"github.com/sirupsen/logrus"
+	metallbspr "go.universe.tf/metallb/pkg/speaker"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
+
 	"github.com/cilium/cilium/pkg/bgp/fence"
 	"github.com/cilium/cilium/pkg/k8s"
+	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/k8s/client"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_discover_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1"
 	slim_discover_v1beta1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1beta1"
 	"github.com/cilium/cilium/pkg/k8s/watchers/subscriber"
 	"github.com/cilium/cilium/pkg/lock"
 	nodetypes "github.com/cilium/cilium/pkg/node/types"
-	"github.com/sirupsen/logrus"
-
-	metallbspr "go.universe.tf/metallb/pkg/speaker"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/util/workqueue"
 )
 
 var (
@@ -34,8 +37,8 @@ var _ subscriber.Node = (*MetalLBSpeaker)(nil)
 
 // New creates a new MetalLB BGP speaker controller. Options are provided to
 // specify what the Speaker should announce via BGP.
-func New(ctx context.Context, opts Opts) (*MetalLBSpeaker, error) {
-	ctrl, err := newMetalLBSpeaker(ctx)
+func New(ctx context.Context, clientset client.Clientset, opts Opts) (*MetalLBSpeaker, error) {
+	ctrl, err := newMetalLBSpeaker(ctx, clientset)
 	if err != nil {
 		return nil, err
 	}
@@ -121,12 +124,12 @@ func (s *MetalLBSpeaker) OnUpdateService(svc *slim_corev1.Service) error {
 	s.services[svcID] = svc
 	s.Unlock()
 
-	if err := meta.FromSlimObjectMeta(&svc.ObjectMeta); err != nil {
+	if err := meta.FromObjectMeta(&svc.ObjectMeta); err != nil {
 		l.WithError(err).Error("failed to parse event metadata")
 	}
 
 	l.Debug("adding event to queue")
-	s.queue.Add(epEvent{
+	s.queue.Add(svcEvent{
 		Meta: meta,
 		op:   Update,
 		id:   svcID,
@@ -154,7 +157,7 @@ func (s *MetalLBSpeaker) OnDeleteService(svc *slim_corev1.Service) error {
 	delete(s.services, svcID)
 	s.Unlock()
 
-	if err := meta.FromSlimObjectMeta(&svc.ObjectMeta); err != nil {
+	if err := meta.FromObjectMeta(&svc.ObjectMeta); err != nil {
 		l.WithError(err).Error("failed to parse event metadata")
 	}
 
@@ -189,7 +192,7 @@ func (s *MetalLBSpeaker) OnUpdateEndpoints(eps *slim_corev1.Endpoints) error {
 	s.Lock()
 	defer s.Unlock()
 
-	if err := meta.FromSlimObjectMeta(&eps.ObjectMeta); err != nil {
+	if err := meta.FromObjectMeta(&eps.ObjectMeta); err != nil {
 		l.WithError(err).Error("failed to parse event metadata")
 	}
 
@@ -224,7 +227,7 @@ func (s *MetalLBSpeaker) OnUpdateEndpointSliceV1(eps *slim_discover_v1.EndpointS
 	s.Lock()
 	defer s.Unlock()
 
-	if err := meta.FromSlimObjectMeta(&eps.ObjectMeta); err != nil {
+	if err := meta.FromObjectMeta(&eps.ObjectMeta); err != nil {
 		l.WithError(err).Error("failed to parse event metadata")
 	}
 
@@ -259,7 +262,7 @@ func (s *MetalLBSpeaker) OnUpdateEndpointSliceV1Beta1(eps *slim_discover_v1beta1
 	s.Lock()
 	defer s.Unlock()
 
-	if err := meta.FromSlimObjectMeta(&eps.ObjectMeta); err != nil {
+	if err := meta.FromObjectMeta(&eps.ObjectMeta); err != nil {
 		l.WithError(err).Error("failed to parse event metadata")
 		return err
 	}
@@ -277,22 +280,30 @@ func (s *MetalLBSpeaker) OnUpdateEndpointSliceV1Beta1(eps *slim_discover_v1beta1
 	return nil
 }
 
-// OnAddNode notifies the Speaker of a new node.
-func (s *MetalLBSpeaker) OnAddNode(node *v1.Node) error {
+type metaGetter interface {
+	GetName() string
+	GetResourceVersion() string
+	GetUID() types.UID
+	GetLabels() map[string]string
+}
+
+// notifyNodeEvent notifies the speaker of a node (K8s Node or CiliumNode) event
+func (s *MetalLBSpeaker) notifyNodeEvent(op Op, nodeMeta metaGetter, podCIDRs *[]string, withDraw bool) error {
 	if s.shutDown() {
 		return ErrShutDown
 	}
-	if node.GetName() != nodetypes.GetName() {
+	if nodeMeta == nil || nodeMeta.GetName() != nodetypes.GetName() {
 		return nil // We don't care for other nodes.
 	}
 	var (
 		l = log.WithFields(logrus.Fields{
-			"component": "MetalLBSpeaker.OnAddNode",
-			"node":      node.Name,
+			"component": "MetalLBSpeaker.notifyNodeEvent",
+			"op":        op.String(),
+			"node":      nodeMeta.GetName(),
 		})
 		meta = fence.Meta{}
 	)
-	if err := meta.FromObjectMeta(&node.ObjectMeta); err != nil {
+	if err := meta.FromObjectMeta(nodeMeta); err != nil {
 		l.WithError(err).Error("failed to parse event metadata")
 		return err
 	}
@@ -300,42 +311,21 @@ func (s *MetalLBSpeaker) OnAddNode(node *v1.Node) error {
 	l.Debug("adding event to queue")
 	s.queue.Add(nodeEvent{
 		Meta:     meta,
-		op:       Add,
-		labels:   nodeLabels(node.Labels),
-		podCIDRs: podCIDRs(node),
+		op:       op,
+		labels:   nodeLabels(nodeMeta.GetLabels()),
+		podCIDRs: podCIDRs,
+		withDraw: withDraw,
 	})
 	return nil
 }
 
-// OnUpdateNode notifies the Speaker of an update to a node.
-func (s *MetalLBSpeaker) OnUpdateNode(oldNode, newNode *v1.Node) error {
-	if s.shutDown() {
-		return ErrShutDown
-	}
-	var (
-		l = log.WithFields(logrus.Fields{
-			"component": "MetalLBSpeaker.OnUpdateNode",
-			"node":      newNode.Name,
-		})
-		meta = fence.Meta{}
-	)
-	if err := meta.FromObjectMeta(&newNode.ObjectMeta); err != nil {
-		l.WithError(err).Error("failed to parse event metadata")
-		return err
-	}
+// OnAddNode notifies the Speaker of a new node.
+func (s *MetalLBSpeaker) OnAddNode(node *slim_corev1.Node, swg *lock.StoppableWaitGroup) error {
+	return s.notifyNodeEvent(Add, node, nodePodCIDRs(node), false)
+}
 
-	if newNode.GetName() != nodetypes.GetName() {
-		return nil // We don't care for other nodes.
-	}
-
-	l.Debug("adding event to queue")
-	s.queue.Add(nodeEvent{
-		Meta:     meta,
-		op:       Update,
-		labels:   nodeLabels(newNode.Labels),
-		podCIDRs: podCIDRs(newNode),
-	})
-	return nil
+func (s *MetalLBSpeaker) OnUpdateNode(oldNode, newNode *slim_corev1.Node, swg *lock.StoppableWaitGroup) error {
+	return s.notifyNodeEvent(Update, newNode, nodePodCIDRs(newNode), false)
 }
 
 // OnDeleteNode notifies the Speaker of a node deletion.
@@ -344,34 +334,28 @@ func (s *MetalLBSpeaker) OnUpdateNode(oldNode, newNode *v1.Node) error {
 // is shuttig down it will send a BGP message to its peer
 // instructing it to withdrawal all previously advertised
 // routes.
-func (s *MetalLBSpeaker) OnDeleteNode(node *v1.Node) error {
-	if s.shutDown() {
-		return ErrShutDown
-	}
-	var (
-		l = log.WithFields(logrus.Fields{
-			"component": "MetalLBSpeaker.OnDeleteNode",
-			"node":      node.Name,
-		})
-		meta = fence.Meta{}
-	)
-	if err := meta.FromObjectMeta(&node.ObjectMeta); err != nil {
-		l.WithError(err).Error("failed to parse event metadata")
-		return err
-	}
+func (s *MetalLBSpeaker) OnDeleteNode(node *slim_corev1.Node, swg *lock.StoppableWaitGroup) error {
+	return s.notifyNodeEvent(Delete, node, nodePodCIDRs(node), true)
+}
 
-	if node.GetName() != nodetypes.GetName() {
-		return nil // We don't care for other nodes.
-	}
-	l.Debug("adding event to queue")
-	s.queue.Add(nodeEvent{
-		Meta:     meta,
-		op:       Delete,
-		labels:   nodeLabels(node.Labels),
-		podCIDRs: podCIDRs(node),
-		withDraw: true,
-	})
-	return nil
+// OnAddCiliumNode notifies the Speaker of a new CiliumNode.
+func (s *MetalLBSpeaker) OnAddCiliumNode(node *ciliumv2.CiliumNode, swg *lock.StoppableWaitGroup) error {
+	return s.notifyNodeEvent(Add, node, ciliumNodePodCIDRs(node), false)
+}
+
+// OnUpdateCiliumNode notifies the Speaker of an update to a CiliumNode.
+func (s *MetalLBSpeaker) OnUpdateCiliumNode(oldNode, newNode *ciliumv2.CiliumNode, swg *lock.StoppableWaitGroup) error {
+	return s.notifyNodeEvent(Update, newNode, ciliumNodePodCIDRs(newNode), false)
+}
+
+// OnDeleteCiliumNode notifies the Speaker of a CiliumNode deletion.
+//
+// When the speaker discovers the node that it is running on
+// is shuttig down it will send a BGP message to its peer
+// instructing it to withdrawal all previously advertised
+// routes.
+func (s *MetalLBSpeaker) OnDeleteCiliumNode(node *ciliumv2.CiliumNode, swg *lock.StoppableWaitGroup) error {
+	return s.notifyNodeEvent(Delete, node, ciliumNodePodCIDRs(node), true)
 }
 
 // RegisterSvcCache registers the K8s watcher cache with this Speaker.
@@ -406,9 +390,9 @@ func convertInternalEndpoints(in *k8s.Endpoints) *metallbspr.Endpoints {
 		return nil
 	}
 	out := new(metallbspr.Endpoints)
-	for ip, be := range in.Backends {
+	for addrCluster, be := range in.Backends {
 		ep := metallbspr.Endpoint{
-			IP:       ip,
+			IP:       addrCluster.Addr().String(),
 			NodeName: &be.NodeName,
 		}
 		out.Ready = append(out.Ready, ep)
@@ -447,16 +431,25 @@ func convertEndpointSliceV1(in *slim_discover_v1.EndpointSlice) *metallbspr.Endp
 	}
 	out := new(metallbspr.Endpoints)
 	for _, ep := range in.Endpoints {
-		for _, addr := range ep.Addresses {
-			out.Ready = append(out.Ready, metallbspr.Endpoint{
-				IP:       addr,
-				NodeName: ep.NodeName,
-			})
+		if isConditionReadyForSliceV1(ep.Conditions) {
+			for _, addr := range ep.Addresses {
+				out.Ready = append(out.Ready, metallbspr.Endpoint{
+					IP:       addr,
+					NodeName: ep.NodeName,
+				})
+			}
 		}
 		// See above comment in convertEndpoints() for why we only append
 		// "ready" endpoints.
 	}
 	return out
+}
+
+func isConditionReadyForSliceV1(conditions slim_discover_v1.EndpointConditions) bool {
+	if conditions.Ready == nil {
+		return true
+	}
+	return *conditions.Ready
 }
 
 func convertEndpointSliceV1Beta1(in *slim_discover_v1beta1.EndpointSlice) *metallbspr.Endpoints {
@@ -465,16 +458,25 @@ func convertEndpointSliceV1Beta1(in *slim_discover_v1beta1.EndpointSlice) *metal
 	}
 	out := new(metallbspr.Endpoints)
 	for _, ep := range in.Endpoints {
-		for _, addr := range ep.Addresses {
-			out.Ready = append(out.Ready, metallbspr.Endpoint{
-				IP:       addr,
-				NodeName: ep.NodeName,
-			})
+		if isConditionReadyForSliceV1Beta1(ep.Conditions) {
+			for _, addr := range ep.Addresses {
+				out.Ready = append(out.Ready, metallbspr.Endpoint{
+					IP:       addr,
+					NodeName: ep.NodeName,
+				})
+			}
 		}
 		// See above comment in convertEndpoints() for why we only append
 		// "ready" endpoints.
 	}
 	return out
+}
+
+func isConditionReadyForSliceV1Beta1(conditions slim_discover_v1beta1.EndpointConditions) bool {
+	if conditions.Ready == nil {
+		return true
+	}
+	return *conditions.Ready
 }
 
 // nodeLabels copies the provided labels and returns
@@ -487,7 +489,7 @@ func nodeLabels(l map[string]string) *map[string]string {
 	return &n
 }
 
-func podCIDRs(node *v1.Node) *[]string {
+func nodePodCIDRs(node *slim_corev1.Node) *[]string {
 	if node == nil {
 		return nil
 	}
@@ -501,5 +503,14 @@ func podCIDRs(node *v1.Node) *[]string {
 		}
 	}
 	podCIDRs = append(podCIDRs, node.Spec.PodCIDRs...)
+	return &podCIDRs
+}
+
+func ciliumNodePodCIDRs(node *ciliumv2.CiliumNode) *[]string {
+	if node == nil {
+		return nil
+	}
+	podCIDRs := make([]string, 0, len(node.Spec.IPAM.PodCIDRs))
+	podCIDRs = append(podCIDRs, node.Spec.IPAM.PodCIDRs...)
 	return &podCIDRs
 }

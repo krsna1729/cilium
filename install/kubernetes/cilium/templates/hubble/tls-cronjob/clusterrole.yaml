@@ -3,12 +3,13 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: hubble-generate-certs
+  labels:
+    app.kubernetes.io/part-of: cilium
 rules:
   - apiGroups:
       - ""
     resources:
       - secrets
-      - configmaps
     verbs:
       - create
   - apiGroups:
@@ -24,17 +25,9 @@ rules:
   - apiGroups:
       - ""
     resources:
-      - configmaps
-    resourceNames:
-      - hubble-ca-cert
-    verbs:
-      - update
-  - apiGroups:
-      - ""
-    resources:
       - secrets
     resourceNames:
-      - hubble-ca-secret
+      - cilium-ca
     verbs:
       - get
       - update

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package mock
 
@@ -12,37 +12,74 @@ import (
 
 type mockMetrics struct {
 	mutex                 lock.RWMutex
-	allocationAttempts    map[string]int64
+	allocationAttempts    map[string]histogram
+	releaseAttempts       map[string]histogram
 	ipAllocations         map[string]int64
 	ipReleases            map[string]int64
+	interfaceAllocations  map[string]int64
 	allocatedIPs          map[string]int
 	availableInterfaces   int
+	interfaceCandidates   int
+	emptyInterfaceSlots   int
 	availableIPsPerSubnet map[string]int
 	nodes                 map[string]int
 	resyncCount           int64
+	nodeIPAvailable       map[string]int
+	nodeIPUsed            map[string]int
+	nodeIPNeeded          map[string]int
+}
+
+type histogram struct {
+	count int64
+	sum   float64
 }
 
 // NewMockMetrics returns a new metrics implementation with a mocked backend
 func NewMockMetrics() *mockMetrics {
 	return &mockMetrics{
-		allocationAttempts:    map[string]int64{},
+		allocationAttempts:    map[string]histogram{},
+		releaseAttempts:       map[string]histogram{},
+		interfaceAllocations:  map[string]int64{},
 		ipAllocations:         map[string]int64{},
 		ipReleases:            map[string]int64{},
 		allocatedIPs:          map[string]int{},
 		nodes:                 map[string]int{},
 		availableIPsPerSubnet: map[string]int{},
+		nodeIPAvailable:       map[string]int{},
+		nodeIPUsed:            map[string]int{},
+		nodeIPNeeded:          map[string]int{},
 	}
 }
 
-func (m *mockMetrics) AllocationAttempts(status, subnetID string) int64 {
+func (m *mockMetrics) GetAllocationAttempts(typ, status, subnetID string) int64 {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	return m.allocationAttempts[fmt.Sprintf("status=%s, subnetId=%s", status, subnetID)]
+	return m.allocationAttempts[fmt.Sprintf("type=%s, status=%s, subnetId=%s", typ, status, subnetID)].count
 }
 
-func (m *mockMetrics) IncAllocationAttempt(status, subnetID string) {
+func (m *mockMetrics) AllocationAttempt(typ, status, subnetID string, observer float64) {
 	m.mutex.Lock()
-	m.allocationAttempts[fmt.Sprintf("status=%s, subnetId=%s", status, subnetID)]++
+	defer m.mutex.Unlock()
+	key := fmt.Sprintf("type=%s, status=%s, subnetId=%s", typ, status, subnetID)
+	value := m.allocationAttempts[key]
+	value.count++
+	value.sum += observer
+	m.allocationAttempts[key] = value
+}
+
+func (m *mockMetrics) ReleaseAttempt(typ, status, subnetID string, observer float64) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	key := fmt.Sprintf("type=%s, status=%s, subnetId=%s", typ, status, subnetID)
+	value := m.releaseAttempts[key]
+	value.count++
+	value.sum += observer
+	m.releaseAttempts[key] = value
+}
+
+func (m *mockMetrics) IncInterfaceAllocation(subnetID string) {
+	m.mutex.Lock()
+	m.interfaceAllocations[fmt.Sprintf("subnetId=%s", subnetID)]++
 	m.mutex.Unlock()
 }
 
@@ -88,6 +125,30 @@ func (m *mockMetrics) SetAvailableInterfaces(available int) {
 	m.mutex.Unlock()
 }
 
+func (m *mockMetrics) InterfaceCandidates() int {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.interfaceCandidates
+}
+
+func (m *mockMetrics) SetInterfaceCandidates(interfaceCandidates int) {
+	m.mutex.Lock()
+	m.interfaceCandidates = interfaceCandidates
+	m.mutex.Unlock()
+}
+
+func (m *mockMetrics) EmptyInterfaceSlots() int {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.emptyInterfaceSlots
+}
+
+func (m *mockMetrics) SetEmptyInterfaceSlots(emptyInterfaceSlots int) {
+	m.mutex.Lock()
+	m.emptyInterfaceSlots = emptyInterfaceSlots
+	m.mutex.Unlock()
+}
+
 func (m *mockMetrics) Nodes(category string) int {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
@@ -115,6 +176,24 @@ func (m *mockMetrics) ResyncCount() int64 {
 func (m *mockMetrics) IncResyncCount() {
 	m.mutex.Lock()
 	m.resyncCount++
+	m.mutex.Unlock()
+}
+
+func (m *mockMetrics) SetIPAvailable(s string, n int) {
+	m.mutex.Lock()
+	m.nodeIPAvailable[s] = n
+	m.mutex.Unlock()
+}
+
+func (m *mockMetrics) SetIPUsed(s string, n int) {
+	m.mutex.Lock()
+	m.nodeIPUsed[s] = n
+	m.mutex.Unlock()
+}
+
+func (m *mockMetrics) SetIPNeeded(s string, n int) {
+	m.mutex.Lock()
+	m.nodeIPNeeded[s] = n
 	m.mutex.Unlock()
 }
 

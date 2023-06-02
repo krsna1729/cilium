@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of Cilium
+// Copyright Authors of Cilium
 
-//go:build !race && !privileged_tests
-// +build !race,!privileged_tests
+//go:build !race
 
 package rate
 
-import "gopkg.in/check.v1"
+import check "github.com/cilium/checkmate"
 
 func (b *ControllerSuite) TestStressRateLimiter(c *check.C) {
 	b.testStressRateLimiter(c, 1000)

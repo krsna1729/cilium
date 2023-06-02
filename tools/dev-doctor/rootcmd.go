@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020-2021 Authors of Cilium
+// Copyright Authors of Cilium
 
 package main
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"text/tabwriter"
 
 	"github.com/blang/semver/v4"
 	"github.com/spf13/cobra"
+	"golang.org/x/mod/modfile"
 )
 
 var rootCmd = &cobra.Command{
@@ -26,21 +28,52 @@ var (
 
 func init() {
 	flags := rootCmd.Flags()
-	backportingChecks = flags.Bool("backporting", false, "run backporting checks")
-	nfsFirewallChecks = flags.Bool("nfs-firewall", false, "run extra NFS firewall checks, requires root privileges")
+	backportingChecks = flags.Bool("backporting", false, "Run backporting checks")
+	nfsFirewallChecks = flags.Bool("nfs-firewall", false, "Run extra NFS firewall checks, requires root privileges")
+}
+
+func readGoModGoVersion(rootDir string) (*semver.Version, error) {
+	goModFile := "go.mod"
+	path := filepath.Join(rootDir, goModFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	mod, err := modfile.Parse(goModFile, data, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if mod.Go == nil {
+		return nil, fmt.Errorf("no go statement found in %s", path)
+	}
+	ver, err := semver.ParseTolerant(mod.Go.Version)
+	if err != nil {
+		return nil, err
+	}
+	return &ver, nil
 }
 
 func rootCmdRun(cmd *cobra.Command, args []string) {
-	minGoVersion, err := semver.ParseTolerant(minGoVersionStr)
+	rootDir := goPath() + "/src/github.com/cilium/cilium"
+
+	// $GOPATH is optional to set with a module-based Go setup
+	// If we cannot find src path via `$GOPATH`, just look in
+	// the `make` dir for `go.mod`
+	if _, err := os.Stat(rootDir); os.IsNotExist(err) {
+		rootDir, _ = os.Getwd()
+	}
+
+	minGoVersion, err := readGoModGoVersion(rootDir)
 	if err != nil {
-		panic(fmt.Sprintf("cannot parse minGoVersionStr: %q", minGoVersionStr))
+		panic(fmt.Sprintf("cannot read go version from go.mod: %v", err))
 	}
 
 	checks := []check{
 		osArchCheck{},
 		unameCheck{},
 		rootDirCheck{
-			rootDir: goPath() + "/src/github.com/cilium/cilium",
+			rootDir: rootDir,
 		},
 		&binaryCheck{
 			name:          "make",
@@ -53,7 +86,14 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 			ifNotFound:    checkError,
 			versionArgs:   []string{"version"},
 			versionRegexp: regexp.MustCompile(`go version go(\d+\.\d+\S*)`),
-			minVersion:    &minGoVersion,
+			minVersion:    minGoVersion,
+		},
+		&binaryCheck{
+			name:          "tparse",
+			ifNotFound:    checkWarning,
+			versionArgs:   []string{"-v"},
+			versionRegexp: regexp.MustCompile(`tparse version: v(\d+\.\d+\.\d+)`),
+			hint:          `Run "go install github.com/mfridman/tparse@latest"`,
 		},
 		&binaryCheck{
 			name:          "clang",
@@ -81,17 +121,17 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 			command:       "docker",
 			ifNotFound:    checkWarning,
 			versionArgs:   []string{"buildx", "version"},
-			versionRegexp: regexp.MustCompile(`github\.com/docker/buildx v(\d+\.\d+\.\d+)`),
-			hint:          "see https://docs.docker.com/engine/install/",
+			versionRegexp: regexp.MustCompile(`github\.com/docker/buildx v?(\d+\.\d+\.\d+)`),
+			hint:          "see https://docs.docker.com/buildx/working-with-buildx/",
 		},
-		// FIXME add libelf-devel check?
 		&binaryCheck{
 			name:          "ginkgo",
 			ifNotFound:    checkWarning,
 			versionArgs:   []string{"version"},
 			versionRegexp: regexp.MustCompile(`Ginkgo Version (\d+\.\d+\S*)`),
 			minVersion:    &semver.Version{Major: 1, Minor: 4, Patch: 0},
-			hint:          `Run "go get -u github.com/onsi/ginkgo/ginkgo".`,
+			maxVersion:    &semver.Version{Major: 2, Minor: 0, Patch: 0},
+			hint:          `Run "go install github.com/onsi/ginkgo/ginkgo@latest".`,
 		},
 		// FIXME add gomega check?
 		&binaryCheck{
@@ -113,7 +153,7 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 			ifNotFound:    checkWarning,
 			versionArgs:   []string{"version"},
 			versionRegexp: regexp.MustCompile(`Version:"v(\d+\.\d+\.\d+)"`),
-			minVersion:    &semver.Version{Major: 3, Minor: 0, Patch: 0},
+			minVersion:    &semver.Version{Major: 3, Minor: 6, Patch: 0},
 		},
 		&binaryCheck{
 			name:          "llc",
@@ -140,12 +180,27 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 			ifNotFound:     checkInfo,
 			versionArgs:    []string{"--version"},
 			versionRegexp:  regexp.MustCompile(`Oracle VM VirtualBox Headless Interface (\d+\.\d+\.\d+\S*)`),
+			hint:           "run \"VBoxHeadless --help\" to diagnose why vboxheadless failed to execute",
 		},
 		&binaryCheck{
 			name:          "pip3",
 			ifNotFound:    checkWarning,
 			versionArgs:   []string{"--version"},
 			versionRegexp: regexp.MustCompile(`pip (\d+\.\d+\S*)`),
+		},
+		&binaryCheck{
+			name:          "cfssl",
+			ifNotFound:    checkWarning,
+			versionArgs:   []string{"version"},
+			versionRegexp: regexp.MustCompile(`Version: (.*)`),
+			hint:          "See https://github.com/cloudflare/cfssl#installation.",
+		},
+		&binaryCheck{
+			name:          "cfssljson",
+			ifNotFound:    checkWarning,
+			versionArgs:   []string{"-version"},
+			versionRegexp: regexp.MustCompile(`Version: (.*)`),
+			hint:          "See https://github.com/cloudflare/cfssl#installation.",
 		},
 		dockerGroupCheck{},
 	}
@@ -190,13 +245,13 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 		checks = append(checks,
 			etcNFSConfCheck{},
 			&iptablesRuleCheck{
-				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.34.0/24", "--dport", "111", "-j", "ACCEPT"},
+				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.61.0/24", "--dport", "111", "-j", "ACCEPT"},
 			},
 			&iptablesRuleCheck{
-				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.34.0/24", "--dport", "2049", "-j", "ACCEPT"},
+				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.61.0/24", "--dport", "2049", "-j", "ACCEPT"},
 			},
 			&iptablesRuleCheck{
-				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.34.0/24", "--dport", "20048", "-j", "ACCEPT"},
+				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.61.0/24", "--dport", "20048", "-j", "ACCEPT"},
 			},
 		)
 	}

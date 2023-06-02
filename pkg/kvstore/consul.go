@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package kvstore
 
@@ -12,6 +12,10 @@ import (
 	"os"
 	"time"
 
+	consulAPI "github.com/hashicorp/consul/api"
+	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
+
 	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/inctimer"
@@ -19,10 +23,6 @@ import (
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/spanstat"
-
-	consulAPI "github.com/hashicorp/consul/api"
-	"github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -43,12 +43,15 @@ type consulModule struct {
 }
 
 var (
-	//consulDummyAddress can be overwritten from test invokers using ldflags
+	// consulDummyAddress can be overwritten from test invokers using ldflags
 	consulDummyAddress = "https://127.0.0.1:8501"
-	//consulDummyConfigFile can be overwritten from test invokers using ldflags
+	// consulDummyConfigFile can be overwritten from test invokers using ldflags
 	consulDummyConfigFile = "/tmp/cilium-consul-certs/cilium-consul.yaml"
 
 	module = newConsulModule()
+
+	// ErrNotImplemented is the error which is returned when a functionality is not implemented.
+	ErrNotImplemented = errors.New("not implemented")
 )
 
 func init() {
@@ -115,6 +118,10 @@ func (c *consulModule) getConfig() map[string]string {
 }
 
 func (c *consulModule) newClient(ctx context.Context, opts *ExtraOptions) (BackendOperations, chan error) {
+	log.WithFields(logrus.Fields{
+		logfields.URL: "https://cilium.herokuapp.com/",
+	}).Warning("Support for Consul as a kvstore backend has been deprecated due to lack of maintainers. If you are interested in helping to maintain Consul support in Cilium, please reach out on GitHub or the official Cilium slack")
+
 	errChan := make(chan error, 1)
 	backend, err := c.connectConsulClient(ctx, opts)
 	if err != nil {
@@ -542,7 +549,7 @@ func (c *consulClient) getPrefix(ctx context.Context, prefix string) (k string, 
 	return pairs[0].Key, pairs[0].Value, nil
 }
 
-// UpdateIfLocked atomically creates a key or fails if it already exists if the client is still holding the given lock.
+// UpdateIfLocked updates a key if the client is still holding the given lock.
 func (c *consulClient) UpdateIfLocked(ctx context.Context, key string, value []byte, lease bool, lock KVLocker) error {
 	return c.Update(ctx, key, value, lease)
 }
@@ -722,7 +729,7 @@ func (c *consulClient) listPrefix(ctx context.Context, prefix string) (KeyValueP
 }
 
 // Close closes the consul session
-func (c *consulClient) Close() {
+func (c *consulClient) Close(ctx context.Context) {
 	close(c.statusCheckErrors)
 	if c.controllers != nil {
 		c.controllers.RemoveAll()
@@ -763,4 +770,14 @@ func (c *consulClient) ListAndWatch(ctx context.Context, name, prefix string, ch
 // StatusCheckErrors returns a channel which receives status check errors
 func (c *consulClient) StatusCheckErrors() <-chan error {
 	return c.statusCheckErrors
+}
+
+// UserEnforcePresence is not implemented for the consul backend
+func (c *consulClient) UserEnforcePresence(ctx context.Context, name string, roles []string) error {
+	return ErrNotImplemented
+}
+
+// UserEnforceAbsence is not implemented for the consul backend
+func (c *consulClient) UserEnforceAbsence(ctx context.Context, name string) error {
+	return ErrNotImplemented
 }

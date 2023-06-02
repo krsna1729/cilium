@@ -13,9 +13,9 @@ Troubleshooting
 This document describes how to troubleshoot Cilium in different deployment
 modes. It focuses on a full deployment of Cilium within a datacenter or public
 cloud. If you are just looking for a simple way to experiment, we highly
-recommend trying out the :ref:`gs_guide` instead.
+recommend trying out the :ref:`getting_started` guide instead.
 
-This guide assumes that you have read the :ref:`concepts` which explains all
+This guide assumes that you have read the :ref:`network_root` and `security_root` which explain all
 the components and concepts.
 
 We use GitHub issues to maintain a list of `Cilium Frequently Asked Questions
@@ -73,7 +73,7 @@ of all nodes in the cluster:
 
 .. code-block:: shell-session
 
-   curl -sLO https://raw.githubusercontent.com/cilium/cilium/master/contrib/k8s/k8s-cilium-exec.sh
+   curl -sLO https://raw.githubusercontent.com/cilium/cilium/main/contrib/k8s/k8s-cilium-exec.sh
    chmod +x ./k8s-cilium-exec.sh
 
 ... and run ``cilium status`` on all nodes:
@@ -84,7 +84,7 @@ of all nodes in the cluster:
    KVStore:                Ok   Etcd: http://127.0.0.1:2379 - (Leader) 3.1.10
    ContainerRuntime:       Ok
    Kubernetes:             Ok   OK
-   Kubernetes APIs:        ["extensions/v1beta1::Ingress", "core/v1::Node", "CustomResourceDefinition", "cilium/v2::CiliumNetworkPolicy", "networking.k8s.io/v1::NetworkPolicy", "core/v1::Service", "core/v1::Endpoint"]
+   Kubernetes APIs:        ["networking.k8s.io/v1beta1::Ingress", "core/v1::Node", "CustomResourceDefinition", "cilium/v2::CiliumNetworkPolicy", "networking.k8s.io/v1::NetworkPolicy", "core/v1::Service", "core/v1::Endpoint"]
    Cilium:                 Ok   OK
    NodeMonitor:            Listening for events on 2 CPUs with 64x4096 of shared memory
    Cilium health daemon:   Ok
@@ -126,10 +126,10 @@ e.g.:
 .. code-block:: shell-session
 
    $ cilium status
-   KVStore:                Ok   etcd: 1/1 connected: https://192.168.33.11:2379 - 3.2.7 (Leader)
+   KVStore:                Ok   etcd: 1/1 connected: https://192.168.60.11:2379 - 3.2.7 (Leader)
    ContainerRuntime:       Ok
    Kubernetes:             Ok   OK
-   Kubernetes APIs:        ["core/v1::Endpoint", "extensions/v1beta1::Ingress", "core/v1::Node", "CustomResourceDefinition", "cilium/v2::CiliumNetworkPolicy", "networking.k8s.io/v1::NetworkPolicy", "core/v1::Service"]
+   Kubernetes APIs:        ["core/v1::Endpoint", "networking.k8s.io/v1beta1::Ingress", "core/v1::Node", "CustomResourceDefinition", "cilium/v2::CiliumNetworkPolicy", "networking.k8s.io/v1::NetworkPolicy", "core/v1::Service"]
    Cilium:                 Ok   OK
    NodeMonitor:            Listening for events on 2 CPUs with 64x4096 of shared memory
    Cilium health daemon:   Ok
@@ -208,37 +208,6 @@ in the last three minutes:
 
 You may also use ``-o json`` to obtain more detailed information about each
 flow event.
-
-In the following example the first command extracts the numeric security
-identities for all dropped flows which originated in the ``default/xwing`` pod
-in the last three minutes. The numeric security identity can then be used
-together with the Cilium CLI to obtain more information about why a particular
-flow was dropped:
-
-.. code-block:: shell-session
-
-   $ kubectl exec -n kube-system cilium-77lk6 -- \
-       hubble observe --since 3m --type drop --from-pod default/xwing -o json | \
-       jq .destination.identity | sort -u
-   788
-   $ kubectl exec -n kube-system cilium-77lk6 -- \
-       cilium policy trace --src-k8s-pod default:xwing --dst-identity 788
-   ----------------------------------------------------------------
-
-   Tracing From: [k8s:class=xwing, k8s:io.cilium.k8s.policy.cluster=default, k8s:io.cilium.k8s.policy.serviceaccount=default, k8s:io.kubernetes.pod.namespace=default, k8s:org=alliance] => To: [k8s:class=deathstar, k8s:io.cilium.k8s.policy.cluster=default, k8s:io.cilium.k8s.policy.serviceaccount=default, k8s:io.kubernetes.pod.namespace=default, k8s:org=empire] Ports: [0/ANY]
-
-   Resolving ingress policy for [k8s:class=deathstar k8s:io.cilium.k8s.policy.cluster=default k8s:io.cilium.k8s.policy.serviceaccount=default k8s:io.kubernetes.pod.namespace=default k8s:org=empire]
-   * Rule {"matchLabels":{"any:class":"deathstar","any:org":"empire","k8s:io.kubernetes.pod.namespace":"default"}}: selected
-       Allows from labels {"matchLabels":{"any:org":"empire","k8s:io.kubernetes.pod.namespace":"default"}}
-         No label match for [k8s:class=xwing k8s:io.cilium.k8s.policy.cluster=default k8s:io.cilium.k8s.policy.serviceaccount=default k8s:io.kubernetes.pod.namespace=default k8s:org=alliance]
-   1/1 rules selected
-   Found no allow rule
-   Ingress verdict: denied
-
-   Final verdict: DENIED
-
-Please refer to the :ref:`policy troubleshooting guide<policy_tracing>` for
-more details about how to troubleshoot policy related drops.
 
 .. note::
    **Hubble Relay**  allows you to query multiple Hubble instances
@@ -430,12 +399,26 @@ Handling drop (CT: Map insertion failed)
 If connectivity fails and ``cilium monitor --type drop`` shows ``xx drop (CT:
 Map insertion failed)``, then it is likely that the connection tracking table
 is filling up and the automatic adjustment of the garbage collector interval is
-insufficient. Set ``--conntrack-gc-interval`` to an interval lower than the
-default.  Alternatively, the value for ``bpf-ct-global-any-max`` and
+insufficient.
+
+Setting ``--conntrack-gc-interval`` to an interval lower than the current value
+may help. This controls the time interval between two garbage collection runs.
+
+By default ``--conntrack-gc-interval`` is set to 0 which translates to
+using a dynamic interval. In that case, the interval is updated after each
+garbage collection run depending on how many entries where garbage collected.
+If very few or no entries were garbage collected, the interval will increase;
+if many entries were garbage collected, it will decrease. The current interval
+value is reported in the Cilium agent logs.
+
+Alternatively, the value for ``bpf-ct-global-any-max`` and
 ``bpf-ct-global-tcp-max`` can be increased. Setting both of these options will
 be a trade-off of CPU for ``conntrack-gc-interval``, and for
 ``bpf-ct-global-any-max`` and ``bpf-ct-global-tcp-max`` the amount of memory
-consumed.
+consumed. You can track conntrack garbage collection related metrics such as
+``datapath_conntrack_gc_runs_total`` and ``datapath_conntrack_gc_entries`` to
+get visibility into garbage collection runs. Refer to :ref:`metrics` for more
+details.
 
 Enabling datapath debug messages
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -458,22 +441,52 @@ Cilium. The following situations result in unmanaged pods:
 
 * The pod is running in host networking and will use the host's IP address
   directly. Such pods have full network connectivity but Cilium will not
-  provide security policy enforcement for such pods.
+  provide security policy enforcement for such pods by default. To enforce
+  policy against these pods, either set ``hostNetwork`` to false or use
+  :ref:`HostPolicies`.
 
 * The pod was started before Cilium was deployed. Cilium only manages pods
   that have been deployed after Cilium itself was started. Cilium will not
-  provide security policy enforcement for such pods.
+  provide security policy enforcement for such pods. These pods should be
+  restarted in order to ensure that Cilium can provide security policy
+  enforcement.
 
 If pod networking is not managed by Cilium. Ingress and egress policy rules
 selecting the respective pods will not be applied. See the section
 :ref:`network_policy` for more details.
+
+For a quick assessment of whether any pods are not managed by Cilium, the
+`Cilium CLI <https://github.com/cilium/cilium-cli>`_ will print the number
+of managed pods. If this prints that all of the pods are managed by Cilium,
+then there is no problem:
+
+.. code-block:: shell-session
+
+   $ cilium status
+       /¯¯\
+    /¯¯\__/¯¯\    Cilium:         OK
+    \__/¯¯\__/    Operator:       OK
+    /¯¯\__/¯¯\    Hubble:         OK
+    \__/¯¯\__/    ClusterMesh:    disabled
+       \__/
+
+   Deployment        cilium-operator    Desired: 2, Ready: 2/2, Available: 2/2
+   Deployment        hubble-relay       Desired: 1, Ready: 1/1, Available: 1/1
+   Deployment        hubble-ui          Desired: 1, Ready: 1/1, Available: 1/1
+   DaemonSet         cilium             Desired: 2, Ready: 2/2, Available: 2/2
+   Containers:       cilium-operator    Running: 2
+                     hubble-relay       Running: 1
+                     hubble-ui          Running: 1
+                     cilium             Running: 2
+   Cluster Pods:     5/5 managed by Cilium
+   ...
 
 You can run the following script to list the pods which are *not* managed by
 Cilium:
 
 .. code-block:: shell-session
 
-   $ curl -sLO https://raw.githubusercontent.com/cilium/cilium/master/contrib/k8s/k8s-unmanaged.sh
+   $ curl -sLO https://raw.githubusercontent.com/cilium/cilium/main/contrib/k8s/k8s-unmanaged.sh
    $ chmod +x k8s-unmanaged.sh
    $ ./k8s-unmanaged.sh
    kube-system/cilium-hqpk7
@@ -481,9 +494,6 @@ Cilium:
    kube-system/kube-dns-54cccfbdf8-zmv2c
    kube-system/kubernetes-dashboard-77d8b98585-g52k5
    kube-system/storage-provisioner
-
-See section :ref:`policy_tracing` for details and examples on how to use the
-policy tracing feature.
 
 Understand the rendering of your policy
 ---------------------------------------
@@ -586,7 +596,7 @@ Understanding etcd status
 The etcd status is reported when running ``cilium status``. The following line
 represents the status of etcd::
 
-   KVStore:  Ok  etcd: 1/1 connected, lease-ID=29c6732d5d580cb5, lock lease-ID=29c6732d5d580cb7, has-quorum=true: https://192.168.33.11:2379 - 3.4.9 (Leader)
+   KVStore:  Ok  etcd: 1/1 connected, lease-ID=29c6732d5d580cb5, lock lease-ID=29c6732d5d580cb7, has-quorum=true: https://192.168.60.11:2379 - 3.4.9 (Leader)
 
 OK:
   The overall status. Either ``OK`` or ``Failure``.
@@ -606,7 +616,7 @@ has-quorum:
 consecutive-errors:
   Number of consecutive quorum errors. Only printed if errors are present.
 
-https://192.168.33.11:2379 - 3.4.9 (Leader):
+https://192.168.60.11:2379 - 3.4.9 (Leader):
   List of all etcd endpoints stating the etcd version and whether the
   particular endpoint is currently the elected leader. If an etcd endpoint
   cannot be reached, the error is shown.
@@ -644,7 +654,7 @@ cluster size. The larger the cluster, the longer the `interval
 Example of a status with a quorum failure which has not yet reached the
 threshold::
 
-    KVStore: Ok   etcd: 1/1 connected, lease-ID=29c6732d5d580cb5, lock lease-ID=29c6732d5d580cb7, has-quorum=2m2.778966915s since last heartbeat update has been received, consecutive-errors=1: https://192.168.33.11:2379 - 3.4.9 (Leader)
+    KVStore: Ok   etcd: 1/1 connected, lease-ID=29c6732d5d580cb5, lock lease-ID=29c6732d5d580cb7, has-quorum=2m2.778966915s since last heartbeat update has been received, consecutive-errors=1: https://192.168.60.11:2379 - 3.4.9 (Leader)
 
 Example of a status with the number of quorum failures exceeding the threshold::
 
@@ -652,206 +662,11 @@ Example of a status with the number of quorum failures exceeding the threshold::
 
 .. _troubleshooting_clustermesh:
 
-Cluster Mesh Troubleshooting
-============================
+.. include:: ./troubleshooting_clustermesh.rst
 
+.. _troubleshooting_servicemesh:
 
-Install the Cilium CLI
-----------------------
-
-.. include:: ../gettingstarted/cli-download.rst
-
-Generic
--------
-
- #. Validate that the ``cilium-xxx`` as well as the ``cilium-operator-xxx`` pods
-    are healthy and ready. 
-
-    .. code-block:: shell-session
-
-       cilium status
-
- #. Validate the Cluster Mesh is enabled correctly and operational:
-
-    .. code-block:: shell-session
-
-       cilium clustermesh status
-
-
-Manual Verification of Setup
-----------------------------
-
- #. Validate that the ClusterMesh subsystem is initialized by looking for a
-    ``cilium-agent`` log message like this::
-
-       level=info msg="Initializing ClusterMesh routing" path=/var/lib/cilium/clustermesh/ subsys=daemon
-
- #. Validate that the configuration for remote clusters is picked up correctly.
-    For each remote cluster, an info log message ``New remote cluster
-    configuration`` along with the remote cluster name must be logged in the
-    ``cilium-agent`` logs.
-
-    If the configuration is not found, check the following:
-
-    * The Kubernetes secret ``clustermesh-secrets`` is imported correctly.
-
-    * The secret contains a file for each remote cluster with the filename
-      matching the name of the remote cluster.
-
-    * The contents of the file in the secret is a valid etcd configuration
-      consisting of the IP to reach the remote etcd as well as the required
-      certificates to connect to that etcd.
-
-    * Run a ``kubectl exec -ti [...] -- bash`` in one of the Cilium pods and check
-      the contents of the directory ``/var/lib/cilium/clustermesh/``. It must
-      contain a configuration file for each remote cluster along with all the
-      required SSL certificates and keys. The filenames must match the cluster
-      names as provided by the ``--cluster-name`` argument or ``cluster-name``
-      ConfigMap option. If the directory is empty or incomplete, regenerate the
-      secret again and ensure that the secret is correctly mounted into the
-      DaemonSet.
-
- #. Validate that the connection to the remote cluster could be established.
-    You will see a log message like this in the ``cilium-agent`` logs for each
-    remote cluster::
-
-       level=info msg="Connection to remote cluster established"
-
-    If the connection failed, you will see a warning like this::
-
-       level=warning msg="Unable to establish etcd connection to remote cluster"
-
-    If the connection fails, check the following:
-
-    * Validate that the ``hostAliases`` section in the Cilium DaemonSet maps
-      each remote cluster to the IP of the LoadBalancer that makes the remote
-      control plane available.
-
-    * Validate that a local node in the source cluster can reach the IP
-      specified in the ``hostAliases`` section. The ``clustermesh-secrets``
-      secret contains a configuration file for each remote cluster, it will
-      point to a logical name representing the remote cluster:
-
-      .. code-block:: yaml
-
-         endpoints:
-         - https://cluster1.mesh.cilium.io:2379
-
-      The name will *NOT* be resolvable via DNS outside of the cilium pod. The
-      name is mapped to an IP using ``hostAliases``. Run ``kubectl -n
-      kube-system get ds cilium -o yaml`` and grep for the FQDN to retrieve the
-      IP that is configured. Then use ``curl`` to validate that the port is
-      reachable.
-
-    * A firewall between the local cluster and the remote cluster may drop the
-      control plane connection. Ensure that port 2379/TCP is allowed.
-
-State Propagation
------------------
-
- #. Run ``cilium node list`` in one of the Cilium pods and validate that it
-    lists both local nodes and nodes from remote clusters. If this discovery
-    does not work, validate the following:
-
-    * In each cluster, check that the kvstore contains information about
-      *local* nodes by running:
-
-      .. code-block:: shell-session
-
-          cilium kvstore get --recursive cilium/state/nodes/v1/
-
-      .. note::
-
-         The kvstore will only contain nodes of the **local cluster**. It will
-         **not** contain nodes of remote clusters. The state in the kvstore is
-         used for other clusters to discover all nodes so it is important that
-         local nodes are listed.
-
- #. Validate the connectivity health matrix across clusters by running
-    ``cilium-health status`` inside any Cilium pod. It will list the status of
-    the connectivity health check to each remote node.
-
-    If this fails:
-
-    * Make sure that the network allows the health checking traffic as
-      specified in the section :ref:`firewall_requirements`.
-
- #. Validate that identities are synchronized correctly by running ``cilium
-    identity list`` in one of the Cilium pods. It must list identities from all
-    clusters. You can determine what cluster an identity belongs to by looking
-    at the label ``io.cilium.k8s.policy.cluster``.
-
-    If this fails:
-
-    * Is the identity information available in the kvstore of each cluster? You
-      can confirm this by running ``cilium kvstore get --recursive
-      cilium/state/identities/v1/``.
-
-      .. note::
-
-         The kvstore will only contain identities of the **local cluster**. It
-         will **not** contain identities of remote clusters. The state in the
-         kvstore is used for other clusters to discover all identities so it is
-         important that local identities are listed.
-
- #. Validate that the IP cache is synchronized correctly by running ``cilium
-    bpf ipcache list`` or ``cilium map get cilium_ipcache``. The output must
-    contain pod IPs from local and remote clusters.
-
-    If this fails:
-
-    * Is the IP cache information available in the kvstore of each cluster? You
-      can confirm this by running ``cilium kvstore get --recursive
-      cilium/state/ip/v1/``.
-
-      .. note::
-
-         The kvstore will only contain IPs of the **local cluster**. It will
-         **not** contain IPs of remote clusters. The state in the kvstore is
-         used for other clusters to discover all pod IPs so it is important
-         that local identities are listed.
-
- #. When using global services, ensure that global services are configured with
-    endpoints from all clusters. Run ``cilium service list`` in any Cilium pod
-    and validate that the backend IPs consist of pod IPs from all clusters
-    running relevant backends. You can further validate the correct datapath
-    plumbing by running ``cilium bpf lb list`` to inspect the state of the eBPF
-    maps.
-
-    If this fails:
-
-    * Are services available in the kvstore of each cluster? You can confirm
-      this by running ``cilium kvstore get --recursive
-      cilium/state/services/v1/``.
-
-    * Run ``cilium debuginfo`` and look for the section ``k8s-service-cache``. In
-      that section, you will find the contents of the service correlation
-      cache. It will list the Kubernetes services and endpoints of the local
-      cluster.  It will also have a section ``externalEndpoints`` which must
-      list all endpoints of remote clusters.
-
-      ::
-
-          #### k8s-service-cache
-
-          (*k8s.ServiceCache)(0xc00000c500)({
-          [...]
-           services: (map[k8s.ServiceID]*k8s.Service) (len=2) {
-             (k8s.ServiceID) default/kubernetes: (*k8s.Service)(0xc000cd11d0)(frontend:172.20.0.1/ports=[https]/selector=map[]),
-             (k8s.ServiceID) kube-system/kube-dns: (*k8s.Service)(0xc000cd1220)(frontend:172.20.0.10/ports=[metrics dns dns-tcp]/selector=map[k8s-app:kube-dns])
-           },
-           endpoints: (map[k8s.ServiceID]*k8s.Endpoints) (len=2) {
-             (k8s.ServiceID) kube-system/kube-dns: (*k8s.Endpoints)(0xc0000103c0)(10.16.127.105:53/TCP,10.16.127.105:53/UDP,10.16.127.105:9153/TCP),
-             (k8s.ServiceID) default/kubernetes: (*k8s.Endpoints)(0xc0000103f8)(192.168.33.11:6443/TCP)
-           },
-           externalEndpoints: (map[k8s.ServiceID]k8s.externalEndpoints) {
-           }
-          })
-
-      The sections ``services`` and ``endpoints`` represent the services of the
-      local cluster, the section ``externalEndpoints`` lists all remote
-      services and will be correlated with services matching the same
-      ``ServiceID``.
+.. include:: troubleshooting_servicemesh.rst
 
 Symptom Library
 ===============
@@ -868,22 +683,22 @@ fails between endpoints across multiple nodes.
 Troubleshooting steps:
 ~~~~~~~~~~~~~~~~~~~~~~
 
-1. Run ``cilium-health status`` on the node of the source and destination
+#. Run ``cilium-health status`` on the node of the source and destination
    endpoint. It should describe the connectivity from that node to other
    nodes in the cluster, and to a simulated endpoint on each other node.
    Identify points in the cluster that cannot talk to each other. If the
    command does not describe the status of the other node, there may be an
    issue with the KV-Store.
 
-2. Run ``cilium monitor`` on the node of the source and destination endpoint.
+#. Run ``cilium monitor`` on the node of the source and destination endpoint.
    Look for packet drops.
 
-When running in :ref:`arch_overlay` mode:
+   When running in :ref:`arch_overlay` mode:
 
-3. Run ``cilium bpf tunnel list`` and verify that each Cilium node is aware of
+#. Run ``cilium bpf tunnel list`` and verify that each Cilium node is aware of
    the other nodes in the cluster.  If not, check the logfile for errors.
 
-4. If nodes are being populated correctly, run ``tcpdump -n -i cilium_vxlan`` on
+#. If nodes are being populated correctly, run ``tcpdump -n -i cilium_vxlan`` on
    each node to verify whether cross node traffic is being forwarded correctly
    between nodes.
 
@@ -893,12 +708,12 @@ When running in :ref:`arch_overlay` mode:
      other.
    * verify that the firewall on each node allows UDP port 8472.
 
-When running in :ref:`arch_direct_routing` mode:
+   When running in :ref:`arch_direct_routing` mode:
 
-3. Run ``ip route`` or check your cloud provider router and verify that you have
+#. Run ``ip route`` or check your cloud provider router and verify that you have
    routes installed to route the endpoint prefix between all nodes.
 
-4. Verify that the firewall on each node permits to route the endpoint IPs.
+#. Verify that the firewall on each node permits to route the endpoint IPs.
 
 
 Useful Scripts
@@ -919,7 +734,7 @@ Identifies the Cilium pod that is managing a particular pod in a namespace:
 
 .. code-block:: shell-session
 
-    $ curl -sLO https://raw.githubusercontent.com/cilium/cilium/master/contrib/k8s/k8s-get-cilium-pod.sh
+    $ curl -sLO https://raw.githubusercontent.com/cilium/cilium/main/contrib/k8s/k8s-get-cilium-pod.sh
     $ chmod +x k8s-get-cilium-pod.sh
     $ ./k8s-get-cilium-pod.sh luke-pod default
     cilium-zmjj9
@@ -939,7 +754,7 @@ Run a command within all Cilium pods of a cluster
 
 .. code-block:: shell-session
 
-    $ curl -sLO https://raw.githubusercontent.com/cilium/cilium/master/contrib/k8s/k8s-cilium-exec.sh
+    $ curl -sLO https://raw.githubusercontent.com/cilium/cilium/main/contrib/k8s/k8s-cilium-exec.sh
     $ chmod +x k8s-cilium-exec.sh
     $ ./k8s-cilium-exec.sh uptime
      10:15:16 up 6 days,  7:37,  0 users,  load average: 0.00, 0.02, 0.00
@@ -962,7 +777,7 @@ were started before Cilium was deployed.
 
 .. code-block:: shell-session
 
-   $ curl -sLO https://raw.githubusercontent.com/cilium/cilium/master/contrib/k8s/k8s-unmanaged.sh
+   $ curl -sLO https://raw.githubusercontent.com/cilium/cilium/main/contrib/k8s/k8s-unmanaged.sh
    $ chmod +x k8s-unmanaged.sh
    $ ./k8s-unmanaged.sh
    kube-system/cilium-hqpk7
@@ -980,7 +795,7 @@ from your cluster before the failure state is lost.
 Automatic log & state collection
 --------------------------------
 
-.. include:: ../gettingstarted/cli-download.rst
+.. include:: ../installation/cli-download.rst
 
 Then, execute ``cilium sysdump`` command to collect troubleshooting information
 from your Kubernetes cluster:
@@ -1088,7 +903,6 @@ Below is an approximate list of the kind of information in the archive.
 * ``hostname``
 * ``cilium policy get``
 * ``cilium service list``
-* ...
 
 
 Debugging information
@@ -1130,7 +944,7 @@ If you believe to have found an issue in Cilium, please report a
 ensure that developers have the best chance to reproduce the issue.
 
 .. _Slack channel: https://cilium.herokuapp.com
-.. _NodeSelector: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
+.. _NodeSelector: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
 .. _RBAC: https://kubernetes.io/docs/reference/access-authn-authz/rbac/
 .. _CNI: https://github.com/containernetworking/cni
 .. _Volumes: https://kubernetes.io/docs/tasks/configure-pod-container/configure-volume-storage/

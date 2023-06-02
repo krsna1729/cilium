@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019 Authors of Cilium
+// Copyright Authors of Cilium
 
 package dnsproxy
 
@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -14,13 +15,12 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/cilium/cilium/pkg/option"
-
+	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 
-	"github.com/miekg/dns"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 // This is the required size of the OOB buffer to pass to ReadMsgUDP.
@@ -59,42 +59,51 @@ var rawconn6 *net.IPConn // raw socket for sending IPv6
 // IP(V6)_RECVORIGDSTADDR tells the kernel to pass the original destination address/port on recvmsg
 // The socket may be receiving both IPv4 and IPv6 data, so set both options, if enabled.
 func transparentSetsockopt(fd int, ipv4, ipv6 bool) error {
-	var err4, err6 error
 	if ipv6 {
-		err6 = unix.SetsockoptInt(fd, unix.SOL_IPV6, unix.IPV6_TRANSPARENT, 1)
-		if err6 == nil {
-			err6 = unix.SetsockoptInt(fd, unix.SOL_IPV6, unix.IPV6_RECVORIGDSTADDR, 1)
+		if err := unix.SetsockoptInt(fd, unix.SOL_IPV6, unix.IPV6_TRANSPARENT, 1); err != nil {
+			return fmt.Errorf("setsockopt(IPV6_TRANSPARENT) failed: %w", err)
 		}
-		if err6 != nil {
-			return err6
+		if err := unix.SetsockoptInt(fd, unix.SOL_IPV6, unix.IPV6_RECVORIGDSTADDR, 1); err != nil {
+			return fmt.Errorf("setsockopt(IPV6_RECVORIGDSTADDR) failed: %w", err)
 		}
 	}
 	if ipv4 {
-		err4 = unix.SetsockoptInt(fd, unix.SOL_IP, unix.IP_TRANSPARENT, 1)
-		if err4 == nil {
-			err4 = unix.SetsockoptInt(fd, unix.SOL_IP, unix.IP_RECVORIGDSTADDR, 1)
+		if err := unix.SetsockoptInt(fd, unix.SOL_IP, unix.IP_TRANSPARENT, 1); err != nil {
+			return fmt.Errorf("setsockopt(IP_TRANSPARENT) failed: %w", err)
 		}
-		if err4 != nil {
-			return err4
+		if err := unix.SetsockoptInt(fd, unix.SOL_IP, unix.IP_RECVORIGDSTADDR, 1); err != nil {
+			return fmt.Errorf("setsockopt(IP_RECVORIGDSTADDR) failed: %w", err)
 		}
 	}
 	return nil
 }
 
+// listenConfig sets the socket options for the fqdn proxy transparent socket.
+// Note that it is also used for TCP sockets.
 func listenConfig(mark int, ipv4, ipv6 bool) *net.ListenConfig {
 	return &net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			var opErr error
 			err := c.Control(func(fd uintptr) {
-				opErr = transparentSetsockopt(int(fd), ipv4, ipv6)
-				if opErr == nil && mark != 0 {
-					opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, mark)
+				if err := transparentSetsockopt(int(fd), ipv4, ipv6); err != nil {
+					opErr = err
+					return
 				}
-				if opErr == nil {
-					opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				if mark != 0 {
+					if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, mark); err != nil {
+						opErr = fmt.Errorf("setsockopt(SO_MARK) failed: %w", err)
+						return
+					}
 				}
-				if opErr == nil && !option.Config.EnableBPFTProxy {
-					opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+					opErr = fmt.Errorf("setsockopt(SO_REUSEADDR) failed: %w", err)
+					return
+				}
+				if !option.Config.EnableBPFTProxy {
+					if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+						opErr = fmt.Errorf("setsockopt(SO_REUSEPORT) failed: %w", err)
+						return
+					}
 				}
 			})
 			if err != nil {
@@ -105,14 +114,13 @@ func listenConfig(mark int, ipv4, ipv6 bool) *net.ListenConfig {
 		}}
 }
 
-func bindUDP(addr string, ipv4, ipv6 bool) *net.IPConn {
+func bindUDP(addr string, ipv4, ipv6 bool) (*net.IPConn, error) {
 	// Mark outgoing packets as proxy egress return traffic (0x0b00)
 	conn, err := listenConfig(0xb00, ipv4, ipv6).ListenPacket(context.Background(), "ip:udp", addr)
 	if err != nil {
-		log.WithError(err).Errorf("bindUDP failed for address %s", addr)
-		return nil
+		return nil, fmt.Errorf("failed to bind UDP for address %s: %w", addr, err)
 	}
-	return conn.(*net.IPConn)
+	return conn.(*net.IPConn), nil
 }
 
 // NOTE: udpOnce is used in SetSocketOptions below, but assumes we have a
@@ -132,16 +140,23 @@ func (f *sessionUDPFactory) SetSocketOptions(conn *net.UDPConn) error {
 	//   v4 address from a socket bound to "::1" does not work due to kernel
 	//   checking that a route exists from the source address before
 	//   the source address is replaced with the (transparently) changed one
+	var err error
 	udpOnce.Do(func() {
 		if f.ipv4Enabled {
-			rawconn4 = bindUDP("127.0.0.1", f.ipv4Enabled, false) // raw socket for sending IPv4
+			rawconn4, err = bindUDP("127.0.0.1", true, false) // raw socket for sending IPv4
+			if err != nil {
+				return
+			}
 		}
 		if f.ipv6Enabled {
-			rawconn6 = bindUDP("::1", false, f.ipv6Enabled) // raw socket for sending IPv6
+			rawconn6, err = bindUDP("::1", false, true) // raw socket for sending IPv6
+			if err != nil {
+				return
+			}
 		}
 	})
-	if (f.ipv4Enabled && rawconn4 == nil) || (f.ipv6Enabled && rawconn6 == nil) {
-		return fmt.Errorf("Unable to open raw UDP sockets for DNS Proxy")
+	if err != nil {
+		return fmt.Errorf("failed to open raw UDP sockets for DNS Proxy: %w", err)
 	}
 	return nil
 }
@@ -175,6 +190,10 @@ func (f *sessionUDPFactory) ReadRequest(conn *net.UDPConn) ([]byte, dns.SessionU
 		return nil, nil, err
 	}
 	return s.m, s, err
+}
+
+func (f *sessionUDPFactory) ReadRequestConn(conn net.PacketConn) ([]byte, net.Addr, error) {
+	return []byte{}, nil, errors.New("ReadRequestConn is not supported")
 }
 
 // Discard returns 's' to the factory pool

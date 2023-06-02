@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package allocator
 
@@ -10,44 +10,45 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/cilium/cilium/pkg/allocator"
 	"github.com/cilium/cilium/pkg/idpool"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/rate"
-
-	"github.com/sirupsen/logrus"
 )
 
 var (
 	log = logging.DefaultLogger.WithField(logfields.LogSubsys, "kvstorebackend")
 )
 
-// kvstoreBackend is an implentaton of pkg/allocator.Backend. It store
+// kvstoreBackend is an implementaton of pkg/allocator.Backend. It store
 // identities in the following format:
 //
 // Slave keys:
-//   Slave keys are owned by individual nodes:
-//     - basePath/value/key1/node1 => 1001
-//     - basePath/value/key1/node2 => 1001
-//     - basePath/value/key2/node1 => 1002
-//     - basePath/value/key2/node2 => 1002
 //
-//   If at least one key exists with the prefix basePath/value/keyN then that
-//   key must be considered to be in use in the allocation space.
+// Slave keys are owned by individual nodes:
+//   - basePath/value/key1/node1 => 1001
+//   - basePath/value/key1/node2 => 1001
+//   - basePath/value/key2/node1 => 1002
+//   - basePath/value/key2/node2 => 1002
 //
-//   Slave keys are protected by a lease and will automatically get removed
-//   after ~ option.Config.KVstoreLeaseTTL if the node does not renew in time.
+// If at least one key exists with the prefix basePath/value/keyN then that
+// key must be considered to be in use in the allocation space.
+//
+// Slave keys are protected by a lease and will automatically get removed
+// after ~ option.Config.KVstoreLeaseTTL if the node does not renew in time.
 //
 // Master key:
-//    - basePath/id/1001 => key1
-//    - basePath/id/1002 => key2
+//   - basePath/id/1001 => key1
+//   - basePath/id/1002 => key2
 //
-//   Master keys provide the mapping from ID to key. As long as a master key
-//   for an ID exists, the ID is still in use. However, if a master key is no
-//   longer backed by at least one slave key, the garbage collector will
-//   eventually release the master key and return it back to the pool.
+// Master keys provide the mapping from ID to key. As long as a master key
+// for an ID exists, the ID is still in use. However, if a master key is no
+// longer backed by at least one slave key, the garbage collector will
+// eventually release the master key and return it back to the pool.
 type kvstoreBackend struct {
 	// lockless is true if allocation can be done lockless. This depends on
 	// the underlying kvstore backend
@@ -426,7 +427,13 @@ func (k *kvstoreBackend) RunLocksGC(ctx context.Context, staleKeysPrevRound map[
 }
 
 // RunGC scans the kvstore for unused master keys and removes them
-func (k *kvstoreBackend) RunGC(ctx context.Context, rateLimit *rate.Limiter, staleKeysPrevRound map[string]uint64) (map[string]uint64, *allocator.GCStats, error) {
+func (k *kvstoreBackend) RunGC(
+	ctx context.Context,
+	rateLimit *rate.Limiter,
+	staleKeysPrevRound map[string]uint64,
+	minID, maxID idpool.ID,
+) (map[string]uint64, *allocator.GCStats, error) {
+
 	// fetch list of all /id/ keys
 	allocated, err := k.backend.ListPrefix(ctx, k.idPrefix)
 	if err != nil {
@@ -438,11 +445,36 @@ func (k *kvstoreBackend) RunGC(ctx context.Context, rateLimit *rate.Limiter, sta
 
 	staleKeys := map[string]uint64{}
 
+	min := uint64(minID)
+	max := uint64(maxID)
+	reasonOutOfRange := fmt.Sprintf("out of local cluster identity range [%d,%d]", min, max)
+
 	// iterate over /id/
 	for key, v := range allocated {
 		// if k.lockless {
 		// FIXME: Add DeleteOnZeroCount support
 		// }
+
+		// Parse identity ID
+		items := strings.Split(key, "/")
+		if len(items) == 0 {
+			log.WithField(fieldKey, key).WithError(err).Warning("Unknown identity key found, skipping")
+			continue
+		}
+
+		if identityID, err := strconv.ParseUint(items[len(items)-1], 10, 64); err != nil {
+			log.WithField(fieldKey, key).WithError(err).Warning("Parse identity failed, skipping")
+			continue
+		} else {
+			// We should not GC those identities that are out of our scope
+			if identityID < min || identityID > max {
+				log.WithFields(logrus.Fields{
+					fieldKey: key,
+					"reason": reasonOutOfRange,
+				}).Debug("Skipping this key")
+				continue
+			}
+		}
 
 		lock, err := k.lockPath(ctx, key)
 		if err != nil {
@@ -569,8 +601,17 @@ func (k *kvstoreBackend) ListAndWatch(ctx context.Context, handler allocator.Cac
 							fieldKey:   event.Key,
 							fieldValue: event.Value,
 						}).Warning("Unable to decode key value")
-					} else {
-						key = k.keyType.PutKey(string(s))
+						continue
+					}
+
+					key = k.keyType.PutKey(string(s))
+				} else {
+					if event.Typ != kvstore.EventTypeDelete {
+						log.WithFields(logrus.Fields{
+							fieldKey:       event.Key,
+							fieldEventType: event.Typ,
+						}).Error("Received a key with an empty value")
+						continue
 					}
 				}
 

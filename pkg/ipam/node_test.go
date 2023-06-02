@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package ipam
 
-import (
-	"gopkg.in/check.v1"
-)
+import check "github.com/cilium/checkmate"
 
 type testNeededDef struct {
 	available   int

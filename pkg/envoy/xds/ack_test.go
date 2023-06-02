@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package xds
 
@@ -10,10 +7,10 @@ import (
 	"context"
 	"time"
 
+	. "github.com/cilium/checkmate"
+
 	"github.com/cilium/cilium/pkg/checker"
 	"github.com/cilium/cilium/pkg/completion"
-
-	. "gopkg.in/check.v1"
 )
 
 type AckSuite struct{}
@@ -68,12 +65,12 @@ func (c *IsCompletedChecker) Check(params []interface{}, names []string) (result
 
 	// receive from a closed channel returns nil, so test for a previous error before trying again
 	if comp.err != nil {
-		return false, string(err)
+		return false, err
 	}
 
 	select {
 	case comp.err = <-comp.ch:
-		return comp.err == nil, string(err)
+		return comp.err == nil, err
 	default:
 		return false, "not completed yet"
 	}

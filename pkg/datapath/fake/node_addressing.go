@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package fake
 
@@ -7,21 +7,21 @@ import (
 	"net"
 
 	"github.com/cilium/cilium/pkg/cidr"
-	"github.com/cilium/cilium/pkg/datapath"
+	"github.com/cilium/cilium/pkg/datapath/types"
 )
 
 var (
-	IPv4InternalAddress = net.ParseIP("2.2.2.2")
-	IPv4NodePortAddress = net.ParseIP("3.3.3.3")
+	IPv4InternalAddress = net.ParseIP("10.0.0.2")
+	IPv4NodePortAddress = net.ParseIP("10.0.0.3")
 
 	fakeIPv4 = addressFamily{
 		router:          net.ParseIP("1.1.1.2"),
 		primaryExternal: net.ParseIP("1.1.1.1"),
 		allocCIDR:       cidr.MustParseCIDR("1.1.1.0/24"),
 		localAddresses: []net.IP{
-			net.ParseIP("2.2.2.2"),
-			net.ParseIP("3.3.3.3"),
-			net.ParseIP("4.4.4.4"),
+			net.ParseIP("10.0.0.2"),
+			net.ParseIP("10.0.0.3"),
+			net.ParseIP("10.0.0.4"),
 		},
 		lbNodeAddresses: []net.IP{net.IPv4(0, 0, 0, 0), IPv4InternalAddress, IPv4NodePortAddress},
 	}
@@ -49,7 +49,7 @@ type fakeNodeAddressing struct {
 
 // NewIPv6OnlyNodeAddressing returns a new fake node addressing where IPv4 is
 // disabled
-func NewIPv6OnlyNodeAddressing() datapath.NodeAddressing {
+func NewIPv6OnlyNodeAddressing() types.NodeAddressing {
 	return &fakeNodeAddressing{
 		ipv4: addressFamily{},
 		ipv6: fakeIPv6,
@@ -58,7 +58,7 @@ func NewIPv6OnlyNodeAddressing() datapath.NodeAddressing {
 
 // NewIPv4OnlyNodeAddressing returns a new fake node addressing where IPv6 is
 // disabled
-func NewIPv4OnlyNodeAddressing() datapath.NodeAddressing {
+func NewIPv4OnlyNodeAddressing() types.NodeAddressing {
 	return &fakeNodeAddressing{
 		ipv4: fakeIPv4,
 		ipv6: addressFamily{},
@@ -66,7 +66,7 @@ func NewIPv4OnlyNodeAddressing() datapath.NodeAddressing {
 }
 
 // NewNodeAddressing returns a new fake node addressing
-func NewNodeAddressing() datapath.NodeAddressing {
+func NewNodeAddressing() types.NodeAddressing {
 	return &fakeNodeAddressing{
 		ipv4: fakeIPv4,
 		ipv6: fakeIPv6,
@@ -101,10 +101,10 @@ func (a *addressFamily) LoadBalancerNodeAddresses() []net.IP {
 	return a.lbNodeAddresses
 }
 
-func (n *fakeNodeAddressing) IPv6() datapath.NodeAddressingFamily {
+func (n *fakeNodeAddressing) IPv6() types.NodeAddressingFamily {
 	return &n.ipv6
 }
 
-func (n *fakeNodeAddressing) IPv4() datapath.NodeAddressingFamily {
+func (n *fakeNodeAddressing) IPv4() types.NodeAddressingFamily {
 	return &n.ipv4
 }

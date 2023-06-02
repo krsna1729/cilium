@@ -1,18 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018-2020 Authors of Cilium
-
-//go:build !privileged_tests
-// +build !privileged_tests
+// Copyright Authors of Cilium
 
 package store
 
 import (
 	"testing"
 
+	check "github.com/cilium/checkmate"
+
 	"github.com/cilium/cilium/pkg/checker"
 	"github.com/cilium/cilium/pkg/loadbalancer"
-
-	"gopkg.in/check.v1"
 )
 
 // Hook up gocheck into the "go test" runner.
@@ -35,7 +32,7 @@ func (s *ServiceGenericSuite) TestClusterService(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	unmarshal := ClusterService{}
-	err = unmarshal.Unmarshal(b)
+	err = unmarshal.Unmarshal("", b)
 	c.Assert(err, check.IsNil)
 	c.Assert(svc, checker.DeepEquals, unmarshal)
 

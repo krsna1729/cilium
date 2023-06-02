@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of Cilium
+// Copyright Authors of Cilium
 
 package subscriber
 
 import (
 	"fmt"
 
-	v1 "k8s.io/api/core/v1"
+	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	"github.com/cilium/cilium/pkg/lock"
 )
 
 var _ Node = (*NodeChain)(nil)
 
 // Node is implemented by event handlers responding to K8s Node events.
 type Node interface {
-	OnAddNode(*v1.Node) error
-	OnUpdateNode(oldObj, newObj *v1.Node) error
-	OnDeleteNode(*v1.Node) error
+	OnAddNode(*slim_corev1.Node, *lock.StoppableWaitGroup) error
+	OnUpdateNode(oldObj, newObj *slim_corev1.Node, swg *lock.StoppableWaitGroup) error
+	OnDeleteNode(*slim_corev1.Node, *lock.StoppableWaitGroup) error
 }
 
 // NodeChain holds the subsciber.Node implementations that are notified when reacting
@@ -44,12 +45,12 @@ func (l *NodeChain) Register(s Node) {
 }
 
 // NotifyAdd notifies all the subscribers of an add event to a service.
-func (l *NodeChain) OnAddNode(node *v1.Node) error {
+func (l *NodeChain) OnAddNode(node *slim_corev1.Node, swg *lock.StoppableWaitGroup) error {
 	l.RLock()
 	defer l.RUnlock()
 	errs := []error{}
 	for _, s := range l.subs {
-		if err := s.OnAddNode(node); err != nil {
+		if err := s.OnAddNode(node, swg); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -60,12 +61,14 @@ func (l *NodeChain) OnAddNode(node *v1.Node) error {
 }
 
 // NotifyUpdate notifies all the subscribers of an update event to a service.
-func (l *NodeChain) OnUpdateNode(oldNode, newNode *v1.Node) error {
+func (l *NodeChain) OnUpdateNode(oldNode, newNode *slim_corev1.Node,
+	swg *lock.StoppableWaitGroup) error {
+
 	l.RLock()
 	defer l.RUnlock()
 	errs := []error{}
 	for _, s := range l.subs {
-		if err := s.OnUpdateNode(oldNode, newNode); err != nil {
+		if err := s.OnUpdateNode(oldNode, newNode, swg); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -76,12 +79,12 @@ func (l *NodeChain) OnUpdateNode(oldNode, newNode *v1.Node) error {
 }
 
 // NotifyDelete notifies all the subscribers of an update event to a service.
-func (l *NodeChain) OnDeleteNode(node *v1.Node) error {
+func (l *NodeChain) OnDeleteNode(node *slim_corev1.Node, swg *lock.StoppableWaitGroup) error {
 	l.RLock()
 	defer l.RUnlock()
 	errs := []error{}
 	for _, s := range l.subs {
-		if err := s.OnDeleteNode(node); err != nil {
+		if err := s.OnDeleteNode(node, swg); err != nil {
 			errs = append(errs, err)
 		}
 	}

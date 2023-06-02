@@ -9,7 +9,7 @@ on:
   schedule:
     - cron:  '0 5/6 * * *'
   ### FOR TESTING PURPOSES
-  # This workflow runs in the context of `master`, and ignores changes to
+  # This workflow runs in the context of `main`, and ignores changes to
   # workflow files in PRs. For testing changes to this workflow from a PR:
   # - Make sure the PR uses a branch from the base repository (requires write
   #   privileges). It will not work with a branch from a fork (missing secrets).
@@ -56,16 +56,17 @@ concurrency:
     ${{
       (github.event_name == 'schedule' && github.sha) ||
       (github.event_name == 'issue_comment' && (
-        startsWith(github.event.comment.body, 'ci-l4lb') && !startsWith(github.event.comment.body, 'ci-l4lb-') ||
-        startsWith(github.event.comment.body, '/ci-l4lb') && !startsWith(github.event.comment.body, '/ci-l4lb-') ||
-        startsWith(github.event.comment.body, 'test-me-please') && !startsWith(github.event.comment.body, 'test-me-please-') ||
-        startsWith(github.event.comment.body, '/test') && !startsWith(github.event.comment.body, '/test-')
+        github.event.comment.body == '/ci-l4lb' ||
+        github.event.comment.body == '/test'
       ) && github.event.issue.number) ||
       (github.event_name == 'pull_request' && github.event.pull_request.number)
     }}
   cancel-in-progress: true
 
 env:
+  # renovate: datasource=github-releases depName=cilium/cilium-cli
+  cilium_cli_version: v0.14.5
+  cilium_cli_ci_version:
   check_url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 jobs:
@@ -73,12 +74,10 @@ jobs:
     name: Deduce required tests from code changes
     if: |
       (github.event_name == 'issue_comment' && (
-        startsWith(github.event.comment.body, 'ci-l4lb') && !startsWith(github.event.comment.body, 'ci-l4lb-') ||
-        startsWith(github.event.comment.body, '/ci-l4lb') && !startsWith(github.event.comment.body, '/ci-l4lb-') ||
-        startsWith(github.event.comment.body, 'test-me-please') && !startsWith(github.event.comment.body, 'test-me-please-') ||
-        startsWith(github.event.comment.body, '/test') && !startsWith(github.event.comment.body, '/test-')
+        github.event.comment.body == '/ci-l4lb' ||
+        github.event.comment.body == '/test'
       )) ||
-      (github.event_name == 'schedule' && github.repository == 'cilium/cilium') ||
+      github.event_name == 'schedule' ||
       github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
@@ -88,7 +87,7 @@ jobs:
       # paths-filter to work.
       - name: Checkout code
         if: ${{ github.event.issue.pull_request }}
-        uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab # v3.5.2
         with:
           persist-credentials: false
       - name: Retrieve pull request's base and head
@@ -96,11 +95,11 @@ jobs:
         id: pr
         run: |
           curl ${{ github.event.issue.pull_request.url }} > pr.json
-          echo "::set-output name=base::$(jq -r '.base.sha' pr.json)"
-          echo "::set-output name=head::$(jq -r '.head.sha' pr.json)"
+          echo "base=$(jq -r '.base.sha' pr.json)" >> $GITHUB_OUTPUT
+          echo "head=$(jq -r '.head.sha' pr.json)" >> $GITHUB_OUTPUT
       - name: Check code changes
         if: ${{ github.event.issue.pull_request }}
-        uses: dorny/paths-filter@b2feaf19c27470162a626bd6fa8438ae5b263721
+        uses: dorny/paths-filter@4512585405083f25c027a35db413c2b3b9006d50 # v2.11.1
         id: tested-tree
         with:
           base: ${{ steps.pr.outputs.base }}
@@ -111,6 +110,38 @@ jobs:
               - 'daemon/**'
               - 'bpf/**'
               - 'test/l4lb/**'
+              - 'test/nat46x64/**'
+              - 'images/**'
+
+  skip-test-run:
+    # If the modified files are not relevant for this test then we can skip
+    # this test and mark it as successful.
+    if: github.event.comment.body == '/test' && needs.check_changes.outputs.tested == 'false'
+    runs-on: ubuntu-latest
+    needs: check_changes
+    steps:
+    - name: Set up job variables
+      id: vars
+      run: |
+        if [ ${{ github.event.issue.pull_request || github.event.pull_request }} ]; then
+          PR_API_JSON=$(curl \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            ${{ github.event.issue.pull_request.url || github.event.pull_request.url }})
+          SHA=$(echo "$PR_API_JSON" | jq -r ".head.sha")
+        else
+          SHA=${{ github.sha }}
+        fi
+        echo "sha=${SHA}" >> $GITHUB_OUTPUT
+    - name: Set commit status to success
+      uses: Sibz/github-status-action@650dd1a882a76dbbbc4576fb5974b8d22f29847f # v1.1.6
+      with:
+        authToken: ${{ secrets.GITHUB_TOKEN }}
+        sha: ${{ steps.vars.outputs.sha }}
+        context: ${{ github.workflow }}
+        description: L4LB test skipped
+        state: success
+        target_url: ${{ env.check_url }}
 
   # This job is skipped when the workflow was triggered with the generic `/test`
   # trigger if the only modified files were under `test/` or `Documentation/`.
@@ -119,17 +150,24 @@ jobs:
     name: Setup & Test
     if: |
       (github.event_name == 'issue_comment' && (
-        startsWith(github.event.comment.body, 'ci-l4lb') && !startsWith(github.event.comment.body, 'ci-l4lb-') ||
-        startsWith(github.event.comment.body, '/ci-l4lb') && !startsWith(github.event.comment.body, '/ci-l4lb-') ||
-        startsWith(github.event.comment.body, 'test-me-please') && !startsWith(github.event.comment.body, 'test-me-please-') && needs.check_changes.outputs.tested == 'true' ||
-        startsWith(github.event.comment.body, '/test') && !startsWith(github.event.comment.body, '/test-') && needs.check_changes.outputs.tested == 'true'
+        github.event.comment.body == '/ci-l4lb' ||
+        (github.event.comment.body == '/test' && needs.check_changes.outputs.tested == 'true')
       )) ||
-      (github.event_name == 'schedule' && github.repository == 'cilium/cilium') ||
+      github.event_name == 'schedule' ||
       github.event_name == 'pull_request'
-    # We need nested virtualisation which is supported only by MacOS runner
-    runs-on: macos-10.15
-    timeout-minutes: 30
+    # Ubuntu 22.04 runner uses cgroup v2-only which is needed for some
+    # our LB functionality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
+      - name: Checkout main branch to access local actions
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab # v3.5.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Set Environment Variables
+        uses: ./.github/actions/set-env-variables
+
       - name: Set up job variables
         id: vars
         run: |
@@ -143,10 +181,10 @@ jobs:
             SHA=${{ github.sha }}
           fi
 
-          echo ::set-output name=sha::${SHA}
+          echo sha=${SHA} >> $GITHUB_OUTPUT
 
       - name: Set commit status to pending
-        uses: Sibz/github-status-action@650dd1a882a76dbbbc4576fb5974b8d22f29847f
+        uses: Sibz/github-status-action@650dd1a882a76dbbbc4576fb5974b8d22f29847f # v1.1.6
         with:
           authToken: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ steps.vars.outputs.sha }}
@@ -155,40 +193,47 @@ jobs:
           state: pending
           target_url: ${{ env.check_url }}
 
-      - uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579
+      - name: Install Cilium CLI
+        uses: cilium/cilium-cli@d610d6e2774e29aef9565bad935e3b4943d541af # v0.14.5
         with:
+          release-version: ${{ env.cilium_cli_version }}
+          ci-version: ${{ env.cilium_cli_ci_version }}
+
+      - name: Checkout upstream for test files
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab # v3.5.2
+        with:
+          # This is intentionally set to stable branch to avoid using test.sh from pull requests.
+          ref: main
           persist-credentials: false
 
-      - name: Boot Fedora
-        run: |
-          ln -sf ./test/l4lb/Vagrantfile ./Vagrantfile
-          # Retry if it fails (download.fedoraproject.org returns 404 sometimes)
-          # Spend up to 10 seconds on this
-          for i in {1..4}; do
-            if vagrant up --provision; then
-              break
-            fi
-            sleep $i
-          done
-          vagrant ssh-config >> ~/.ssh/config
+      - name: Checkout pull request for Helm chart
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab # v3.5.2
+        with:
+          ref: ${{ steps.vars.outputs.sha }}
+          persist-credentials: false
+          path: pull-request
 
       - name: Wait for image to be available
         timeout-minutes: 10
         shell: bash
         run: |
-          until curl --silent -f -lSL "https://quay.io/api/v1/repository/${{ github.repository_owner }}/cilium-ci/tag/${{ steps.vars.outputs.sha }}/images" &> /dev/null; do sleep 45s; done
+          until docker manifest inspect quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/cilium-ci:${{ steps.vars.outputs.sha }} &> /dev/null; do sleep 45s; done
 
-      - name: Run tests
+      - name: Run LoadBalancing test
         run: |
-          ssh default "sudo /bin/sh -c 'cd /vagrant/test/l4lb && ./test.sh ${{ github.repository_owner}} ${{ steps.vars.outputs.sha }}'"
+          cd ${{ github.workspace }}/test/l4lb && sudo ./test.sh ${{ env.QUAY_ORGANIZATION_DEV }} ${{ steps.vars.outputs.sha }}
+
+      - name: Run NAT46x64 test
+        run: |
+          cd ${{ github.workspace }}/test/nat46x64 && sudo ./test.sh ${{ env.QUAY_ORGANIZATION_DEV }} ${{ steps.vars.outputs.sha }}
 
       - name: Fetch cilium-sysdump
         if: ${{ !success() }}
         run: |
-          scp default:/tmp/cilium-sysdump-out.zip .
+          sudo cilium sysdump --output-filename cilium-sysdump-out
 
       - name: Upload cilium-sysdump
-        uses: actions/upload-artifact@27121b0bdffd731efa15d66772be8dc71245d074
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
         if: ${{ !success() }}
         with:
           name: cilium-sysdump-out.zip
@@ -196,7 +241,7 @@ jobs:
 
       - name: Set commit status to success
         if: ${{ success() }}
-        uses: Sibz/github-status-action@650dd1a882a76dbbbc4576fb5974b8d22f29847f
+        uses: Sibz/github-status-action@650dd1a882a76dbbbc4576fb5974b8d22f29847f # v1.1.6
         with:
           authToken: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ steps.vars.outputs.sha }}
@@ -207,7 +252,7 @@ jobs:
 
       - name: Set commit status to failure
         if: ${{ failure() }}
-        uses: Sibz/github-status-action@650dd1a882a76dbbbc4576fb5974b8d22f29847f
+        uses: Sibz/github-status-action@650dd1a882a76dbbbc4576fb5974b8d22f29847f # v1.1.6
         with:
           authToken: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ steps.vars.outputs.sha }}
@@ -218,7 +263,7 @@ jobs:
 
       - name: Set commit status to cancelled
         if: ${{ cancelled() }}
-        uses: Sibz/github-status-action@650dd1a882a76dbbbc4576fb5974b8d22f29847f
+        uses: Sibz/github-status-action@650dd1a882a76dbbbc4576fb5974b8d22f29847f # v1.1.6
         with:
           authToken: ${{ secrets.GITHUB_TOKEN }}
           sha: ${{ steps.vars.outputs.sha }}
@@ -226,12 +271,3 @@ jobs:
           description: L4LB test cancelled
           state: error
           target_url: ${{ env.check_url }}
-
-      - name: Send slack notification
-        if: ${{ !success() && (github.event_name == 'schedule' || github.event_name == 'push') }}
-        uses: 8398a7/action-slack@c84a35cfa82a01f3733a3cbf5d5260123e55c2f9
-        with:
-          status: ${{ job.status }}
-          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took # selectable (default: repo,message)
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

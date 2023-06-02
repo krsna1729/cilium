@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 Authors of Cilium
-
-//go:build privileged_tests
-// +build privileged_tests
+// Copyright Authors of Cilium
 
 package link
 
 import (
 	"testing"
 
+	"github.com/cilium/cilium/pkg/testutils"
+
+	. "github.com/cilium/checkmate"
 	"github.com/vishvananda/netlink"
-	. "gopkg.in/check.v1"
 )
 
 type LinkSuite struct{}
 
 var _ = Suite(&LinkSuite{})
+
+func (s *LinkSuite) SetUpSuite(c *C) {
+	testutils.PrivilegedTest(c)
+}
 
 func Test(t *testing.T) {
 	TestingT(t)

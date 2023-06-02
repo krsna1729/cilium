@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2021 Authors of Cilium
+# Copyright Authors of Cilium
 
 DIR=$(dirname $(readlink -ne $BASH_SOURCE))
 source "${DIR}/lib/common.sh"
@@ -65,10 +65,13 @@ main() {
 
     git checkout -b pr/$version-digests $version
     ${DIR}/pull-docker-manifests.sh "$@"
+    if grep -q update-helm-values Documentation/Makefile; then
+        logrun make -C Documentation update-helm-values
+    fi
     logecho
     logecho "Check that the following changes look correct:"
     # TODO: Make this less interactive when we have used it enough
-    git add --patch install/kubernetes
+    git add --patch install/kubernetes Documentation/
     git commit -se -m "install: Update image digests for $version" -m "Generated from $1." -m "$(cat digest-$version.txt)"
     echo "Create PR for v$branch with these changes"
     if ! common::askyorn ; then

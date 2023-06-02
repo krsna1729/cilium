@@ -1,11 +1,11 @@
-# Copyright 2020-2021 Authors of Cilium
+# Copyright Authors of Cilium
 # SPDX-License-Identifier: Apache-2.0
 
-ARG COMPILERS_IMAGE=quay.io/cilium/image-compilers:6ed96e618f68cd941b62b546fc8d161db0144d84@sha256:5245610a830b14972d5b287fc0318ac6ab0d420e4afc9b5db9032a04fd706d32
-ARG CILIUM_RUNTIME_IMAGE=quay.io/cilium/cilium-runtime:f08f0c5513d5e9406f951477adfc29b16fe5a02d@sha256:5d6f733b584ec3c05dd70a98d3db22f233a87926dec26c58a94b6d771f5d9f9f
-ARG TESTER_IMAGE=quay.io/cilium/image-tester:eb76f0d4d585946bb0267b4c4478cceed17bbd87@sha256:c9a598cdc4843e62ab4e430f36343ca06d5292506261f17e466e0f1cbb48ddbb
-ARG GOLANG_IMAGE=docker.io/library/golang:1.17.2@sha256:45d45a39258425b0386643efc863b3b3c1481173d64ec6151b18d48b565df9a0
-ARG CILIUM_LLVM_IMAGE=quay.io/cilium/cilium-llvm:0147a23fdada32bd51b4f313c645bcb5fbe188d6@sha256:24fd3ad32471d0e45844c856c38f1b2d4ac8bd0a2d4edf64cffaaa3fd0b21202
+ARG COMPILERS_IMAGE=quay.io/cilium/image-compilers:5569a29cea6b3ad50aeb03102aaf3dc03841197c@sha256:b15dbedb7c49816c74a765e2f6ecdb9359763b8e4e4328d794f48b9cefae9804
+ARG CILIUM_RUNTIME_IMAGE=quay.io/cilium/cilium-runtime:ff45f41cef56a42e1092d478a3914a5fa2c1f8b7@sha256:d8382f7cbbe31287e039add810b83bac5120e414149405fc1f83f9d8bb376b46
+ARG TESTER_IMAGE=quay.io/cilium/image-tester:dd09c8d3ef349a909fbcdc99279516baef153f22@sha256:c056d064cb47c97acd607343db5457e1d49d9338d6d8a87e93e23cc93f052c73
+ARG GOLANG_IMAGE=docker.io/library/golang:1.20.4@sha256:690e4135bf2a4571a572bfd5ddfa806b1cb9c3dea0446ebadaf32bc2ea09d4f9
+ARG CILIUM_LLVM_IMAGE=quay.io/cilium/cilium-llvm:a8c542efc076b62ba683e7699c0013adb6955f0f@sha256:38e8941107bd19eb30bdde6e478760a22325f38d1f2771dfd1b9af81d74235e7
 
 FROM ${COMPILERS_IMAGE} as compilers-image
 
@@ -24,10 +24,16 @@ ARG TARGETARCH
 RUN \
     apt-get update && \
     apt-get upgrade -y --no-install-recommends && \
-    # Only install cross tools on amd64
-    CROSSPKG="" && [ "$TARGETARCH" != "amd64" ] || CROSSPKG="gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu" && \
     apt-get install -y --no-install-recommends \
-      $CROSSPKG \
+      # Install cross tools for both arm64 on amd64
+      gcc-aarch64-linux-gnu \
+      g++-aarch64-linux-gnu \
+      libc6-dev-arm64-cross \
+      binutils-aarch64-linux-gnu \
+      gcc-x86-64-linux-gnu \
+      g++-x86-64-linux-gnu \
+      libc6-dev-amd64-cross \
+      binutils-x86-64-linux-gnu \
       # Dependencies to unzip protoc
       unzip \
       # Base Cilium-build dependencies
@@ -37,7 +43,6 @@ RUN \
       gcc \
       git \
       libc6-dev \
-      libelf-dev \
       make && \
     apt-get purge --auto-remove && \
     apt-get clean && \
@@ -51,10 +56,15 @@ ENV GOROOT /usr/local/go
 ENV GOPATH /go
 ENV PATH "${GOROOT}/bin:${GOPATH}/bin:${PATH}"
 
+RUN CGO_ENABLED=0 go install github.com/go-delve/delve/cmd/dlv@latest
+
 WORKDIR /go/src/github.com/cilium/cilium/images/builder
 RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/builder \
-    ./build-go-deps.sh
+    --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/go/pkg \
+    ./build-debug-wrapper.sh
 
+WORKDIR /go/src/github.com/cilium/cilium/images/builder
 RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/builder \
     ./install-protoc.sh
 
@@ -71,6 +81,6 @@ RUN /test/bin/cst
 
 # this image is large, and re-using layers is beneficial,
 # so final images is not squashed
-FROM rootfs
+FROM rootfs as release
 LABEL maintainer="maintainer@cilium.io"
 WORKDIR /go/src/github.com/cilium/cilium

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2021 Authors of Cilium
-
-//go:build !privileged_tests && integration_tests
-// +build !privileged_tests,integration_tests
+// Copyright Authors of Cilium
 
 package allocator
 
@@ -14,14 +11,14 @@ import (
 	"testing"
 	"time"
 
+	. "github.com/cilium/checkmate"
+
 	"github.com/cilium/cilium/pkg/allocator"
 	"github.com/cilium/cilium/pkg/idpool"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/rand"
 	"github.com/cilium/cilium/pkg/rate"
 	"github.com/cilium/cilium/pkg/testutils"
-
-	. "gopkg.in/check.v1"
 )
 
 const (
@@ -36,11 +33,19 @@ type AllocatorSuite struct {
 	backend string
 }
 
+func (s *AllocatorSuite) SetUpSuite(c *C) {
+	testutils.IntegrationCheck(c)
+}
+
 type AllocatorEtcdSuite struct {
 	AllocatorSuite
 }
 
 var _ = Suite(&AllocatorEtcdSuite{})
+
+func (e *AllocatorEtcdSuite) SetUpSuite(c *C) {
+	testutils.IntegrationCheck(c)
+}
 
 func (e *AllocatorEtcdSuite) SetUpTest(c *C) {
 	e.backend = "etcd"
@@ -49,7 +54,7 @@ func (e *AllocatorEtcdSuite) SetUpTest(c *C) {
 
 func (e *AllocatorEtcdSuite) TearDownTest(c *C) {
 	kvstore.Client().DeletePrefix(context.TODO(), testPrefix)
-	kvstore.Client().Close()
+	kvstore.Client().Close(context.TODO())
 }
 
 type AllocatorConsulSuite struct {
@@ -58,6 +63,10 @@ type AllocatorConsulSuite struct {
 
 var _ = Suite(&AllocatorConsulSuite{})
 
+func (e *AllocatorConsulSuite) SetUpSuite(c *C) {
+	testutils.IntegrationCheck(c)
+}
+
 func (e *AllocatorConsulSuite) SetUpTest(c *C) {
 	e.backend = "consul"
 	kvstore.SetupDummy("consul")
@@ -65,10 +74,10 @@ func (e *AllocatorConsulSuite) SetUpTest(c *C) {
 
 func (e *AllocatorConsulSuite) TearDownTest(c *C) {
 	kvstore.Client().DeletePrefix(context.TODO(), testPrefix)
-	kvstore.Client().Close()
+	kvstore.Client().Close(context.TODO())
 }
 
-//FIXME: this should be named better, it implements pkg/allocator.Backend
+// FIXME: this should be named better, it implements pkg/allocator.Backend
 type TestAllocatorKey string
 
 func (t TestAllocatorKey) GetKey() string { return string(t) }
@@ -298,6 +307,82 @@ func (s *AllocatorSuite) TestGC(c *C) {
 	key, err := allocator.GetByID(context.TODO(), shortID)
 	c.Assert(err, IsNil)
 	c.Assert(key, IsNil)
+}
+
+func (s *AllocatorSuite) TestGC_ShouldSkipOutOfRangeIdentites(c *C) {
+
+	// Allocator1: allocator under test
+	backend, err := NewKVStoreBackend(randomTestName(), "a", TestAllocatorKey(""), kvstore.Client())
+	c.Assert(err, IsNil)
+
+	maxID1 := idpool.ID(4 + c.N)
+	allocator1, err := allocator.NewAllocator(TestAllocatorKey(""), backend, allocator.WithMax(maxID1), allocator.WithoutGC())
+	c.Assert(err, IsNil)
+	c.Assert(allocator1, Not(IsNil))
+
+	defer allocator1.DeleteAllKeys()
+	defer allocator1.Delete()
+
+	allocator1.DeleteAllKeys()
+
+	shortKey1 := TestAllocatorKey("1;")
+	shortID1, _, _, err := allocator1.Allocate(context.Background(), shortKey1)
+	c.Assert(err, IsNil)
+	c.Assert(shortID1, Not(Equals), 0)
+
+	allocator1.Release(context.Background(), shortKey1)
+
+	// Alloctor2: with a non-overlapping range compared with allocator1
+	backend2, err := NewKVStoreBackend(randomTestName(), "a", TestAllocatorKey(""), kvstore.Client())
+	c.Assert(err, IsNil)
+
+	minID2 := maxID1 + 1
+	maxID2 := minID2 + 4
+	allocator2, err := allocator.NewAllocator(TestAllocatorKey(""), backend2, allocator.WithMin(minID2), allocator.WithMax(maxID2), allocator.WithoutGC())
+	c.Assert(err, IsNil)
+	c.Assert(allocator2, Not(IsNil))
+
+	shortKey2 := TestAllocatorKey("2;")
+	shortID2, _, _, err := allocator2.Allocate(context.Background(), shortKey2)
+	c.Assert(err, IsNil)
+	c.Assert(shortID2, Not(Equals), 0)
+
+	defer allocator2.DeleteAllKeys()
+	defer allocator2.Delete()
+
+	allocator2.Release(context.Background(), shortKey2)
+
+	// Perform GC with allocator1: there are two entries in kvstore currently
+	rateLimiter := rate.NewLimiter(10*time.Second, 100)
+
+	keysToDelete := map[string]uint64{}
+	keysToDelete, _, err = allocator1.RunGC(rateLimiter, keysToDelete)
+	c.Assert(err, IsNil)
+	// But, only one will be filtered out and GC'ed
+	c.Assert(len(keysToDelete), Equals, 1)
+	keysToDelete, _, err = allocator1.RunGC(rateLimiter, keysToDelete)
+	c.Assert(err, IsNil)
+	c.Assert(len(keysToDelete), Equals, 0)
+
+	// Wait for cache to be updated via delete notification
+	c.Assert(testutils.WaitUntil(func() bool {
+		key, err := allocator1.GetByID(context.TODO(), shortID1)
+		if err != nil {
+			c.Error(err)
+			return false
+		}
+		return key == nil
+	}, 5*time.Second), IsNil)
+
+	// The key created with allocator1 should be GC'd
+	key, err := allocator1.GetByID(context.TODO(), shortID1)
+	c.Assert(err, IsNil)
+	c.Assert(key, IsNil)
+
+	// The key created with allocator2 should NOT be GC'd
+	key2, err := allocator2.GetByID(context.TODO(), shortID2)
+	c.Assert(err, IsNil)
+	c.Assert(key2, Not(IsNil))
 }
 
 func testAllocator(c *C, maxID idpool.ID, allocatorName string, suffix string) {
@@ -541,7 +626,7 @@ func (s *AllocatorSuite) TestRemoteCache(c *C) {
 	c.Assert(err, IsNil)
 	a2, err := allocator.NewAllocator(TestAllocatorKey(""), backend2, allocator.WithMax(idpool.ID(256)))
 	c.Assert(err, IsNil)
-	rc := a.WatchRemoteKVStore(a2)
+	rc := a.WatchRemoteKVStore("", a2)
 	c.Assert(rc, Not(IsNil))
 
 	// wait for remote cache to be populated

@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018-2019 Authors of Cilium
+// Copyright Authors of Cilium
 
 package identity
 
 import (
-	"fmt"
 	"net"
-	"sync"
+	"strconv"
 
 	"github.com/cilium/cilium/pkg/labels"
+)
+
+const (
+	NodeLocalIdentityType    = "node_local"
+	ReservedIdentityType     = "reserved"
+	ClusterLocalIdentityType = "cluster_local"
+	WellKnownIdentityType    = "well_known"
 )
 
 // Identity is the representation of the security context for a particular set of
@@ -18,11 +24,6 @@ type Identity struct {
 	ID NumericIdentity `json:"id"`
 	// Set of labels that belong to this Identity.
 	Labels labels.Labels `json:"labels"`
-
-	// onceLabelSHA256 makes sure LabelsSHA256 is only set once
-	onceLabelSHA256 sync.Once
-	// SHA256 of labels.
-	LabelsSHA256 string `json:"labelsSHA256"`
 
 	// LabelArray contains the same labels as Labels in a form of a list, used
 	// for faster lookup.
@@ -82,18 +83,6 @@ func (id *Identity) Sanitize() {
 	}
 }
 
-// GetLabelsSHA256 returns the SHA256 of the labels associated with the
-// identity. The SHA is calculated if not already cached.
-func (id *Identity) GetLabelsSHA256() string {
-	id.onceLabelSHA256.Do(func() {
-		if id.LabelsSHA256 == "" {
-			id.LabelsSHA256 = id.Labels.SHA256Sum()
-		}
-	})
-
-	return id.LabelsSHA256
-}
-
 // StringID returns the identity identifier as string
 func (id *Identity) StringID() string {
 	return id.ID.StringID()
@@ -122,6 +111,12 @@ func (id *Identity) IsFixed() bool {
 // (true), or not (false).
 func (id *Identity) IsWellKnown() bool {
 	return WellKnown.lookupByNumericIdentity(id.ID) != nil
+}
+
+// IsWellKnownIdentity returns true if the identity represents a well-known
+// identity, false otherwise.
+func IsWellKnownIdentity(id NumericIdentity) bool {
+	return WellKnown.lookupByNumericIdentity(id) != nil
 }
 
 // NewIdentityFromLabelArray creates a new identity
@@ -154,21 +149,14 @@ func (pair *IPIdentityPair) IsHost() bool {
 // format w.x.y.z if 'host' is true, or as a prefix in the format the w.x.y.z/N
 // if 'host' is false.
 func (pair *IPIdentityPair) PrefixString() string {
-	var suffix string
-	if !pair.IsHost() {
-		var ones int
-		if pair.Mask == nil {
-			if pair.IP.To4() != nil {
-				ones = net.IPv4len
-			} else {
-				ones = net.IPv6len
-			}
-		} else {
-			ones, _ = pair.Mask.Size()
-		}
-		suffix = fmt.Sprintf("/%d", ones)
+	ipstr := pair.IP.String()
+
+	if pair.IsHost() {
+		return ipstr
 	}
-	return fmt.Sprintf("%s%s", pair.IP.String(), suffix)
+
+	ones, _ := pair.Mask.Size()
+	return ipstr + "/" + strconv.Itoa(ones)
 }
 
 // RequiresGlobalIdentity returns true if the label combination requires a
@@ -219,6 +207,7 @@ func LookupReservedIdentityByLabels(lbls labels.Labels) *Identity {
 	}
 
 	for _, lbl := range lbls {
+		var createID bool
 		switch {
 		// If the set of labels contain a fixed identity then and exists in
 		// the map of reserved IDs then return the identity of that reserved ID.
@@ -232,15 +221,43 @@ func LookupReservedIdentityByLabels(lbls labels.Labels) *Identity {
 			return nil
 
 		case lbl.Source == labels.LabelSourceReserved:
-			// If it contains the reserved, local host identity, return it with
-			// the new list of labels. This is to ensure the local node retains
-			// this identity regardless of label changes.
 			id := GetReservedID(lbl.Key)
-			if id == ReservedIdentityHost {
-				identity := NewIdentity(ReservedIdentityHost, lbls)
-				// Pre-calculate the SHA256 hash.
-				identity.GetLabelsSHA256()
-				return identity
+			switch {
+			case id == ReservedIdentityKubeAPIServer && lbls.Has(labels.LabelHost[labels.IDNameHost]):
+				// Due to Golang map iteration order (random) we might get the
+				// ID returned as kube-apiserver. If there's a local host
+				// label, then we know this is local host reserved ID, so
+				// change it as such. All local host traffic should always be
+				// considered host (and not kube-apiserver).
+				//
+				// The kube-apiserver label can be a part of a few identities:
+				//   * host
+				//   * kube-apiserver reserved identity (contains remote-node
+				//     label)
+				//   * (maybe) CIDR
+				id = ReservedIdentityHost
+				fallthrough
+			case id == ReservedIdentityKubeAPIServer && lbls.Has(labels.LabelRemoteNode[labels.IDNameRemoteNode]):
+				createID = true
+
+			case id == ReservedIdentityRemoteNode && lbls.Has(labels.LabelKubeAPIServer[labels.IDNameKubeAPIServer]):
+				// Due to Golang map iteration order (random) we might get the
+				// ID returned as remote-node. If there's a kube-apiserver
+				// label, then we know this is kube-apiserver reserved ID, so
+				// change it as such. Only traffic to non-kube-apiserver nodes
+				// should be considered as remote-node.
+				id = ReservedIdentityKubeAPIServer
+				fallthrough
+			case id == ReservedIdentityHost || id == ReservedIdentityRemoteNode:
+				// If it contains the reserved, local host or remote node
+				// identity, return it with the new list of labels. This is to
+				// ensure that the local node  or remote node retain their
+				// identity regardless of label changes.
+				createID = true
+			}
+
+			if createID {
+				return NewIdentity(id, lbls)
 			}
 
 			// If it doesn't contain a fixed-identity then make sure the set of

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 source "${dir}/helpers.bash"
@@ -32,7 +32,7 @@ SERVER_LABEL="id.server"
 CLIENT_LABEL="id.client"
 
 SVC_IP="f00d::1:1"
-SVC_IP4="2.2.2.2"
+SVC_IP4="10.0.0.2"
 
 cleanup
 logs_clear

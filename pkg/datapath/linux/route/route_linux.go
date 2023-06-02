@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2018 Authors of Cilium
+// Copyright Authors of Cilium
 
 //go:build linux
-// +build linux
 
 package route
 
 import (
 	"fmt"
 	"net"
+	"sort"
 	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+
+	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 )
 
 const (
@@ -42,6 +44,7 @@ func (r *Route) getNetlinkRoute() netlink.Route {
 		Dst:      &r.Prefix,
 		Src:      r.Local,
 		MTU:      r.MTU,
+		Priority: r.Priority,
 		Protocol: netlink.RouteProtocol(r.Proto),
 		Table:    r.Table,
 		Type:     r.Type,
@@ -114,10 +117,10 @@ func Lookup(route Route) (*Route, error) {
 
 // lookup finds a particular route as specified by the filter which points
 // to the specified device. The filter route can have the following fields set:
-//  - Dst
-//  - LinkIndex
-//  - Scope
-//  - Gw
+//   - Dst
+//   - LinkIndex
+//   - Scope
+//   - Gw
 func lookup(route *netlink.Route) *netlink.Route {
 	var filter uint64
 	if route.Dst != nil {
@@ -173,6 +176,7 @@ func createNexthopRoute(route Route, link netlink.Link, routerNet *net.IPNet) *n
 		LinkIndex: link.Attrs().Index,
 		Dst:       routerNet,
 		Table:     route.Table,
+		Protocol:  linux_defaults.RTProto,
 	}
 
 	// Known issue: scope for IPv6 routes is not propagated correctly. If
@@ -209,17 +213,19 @@ func deleteNexthopRoute(route Route, link netlink.Link, routerNet *net.IPNet) er
 // the following two forms:
 //
 // direct:
-//   prefix dev foo
+//
+//	prefix dev foo
 //
 // nexthop:
-//   prefix via nexthop dev foo
+//
+//	prefix via nexthop dev foo
 //
 // If a nexthop route is specified, this function will check whether a direct
 // route to the nexthop exists and add if required. This means that the
 // following two routes will exist afterwards:
 //
-//   nexthop dev foo
-//   prefix via nexthop dev foo
+//	nexthop dev foo
+//	prefix via nexthop dev foo
 //
 // Due to a bug in the Linux kernel, the prefix route is attempted to be
 // updated RouteReplaceMaxTries with an interval of RouteReplaceRetryInterval.
@@ -228,18 +234,18 @@ func deleteNexthopRoute(route Route, link netlink.Link, routerNet *net.IPNet) er
 // EINVAL if the Netlink calls are issued in short order.
 //
 // An error is returned if the route can not be added or updated.
-func Upsert(route Route) (bool, error) {
+func Upsert(route Route) error {
 	var nexthopRouteCreated bool
 
 	link, err := netlink.LinkByName(route.Device)
 	if err != nil {
-		return false, fmt.Errorf("unable to lookup interface %s: %s", route.Device, err)
+		return fmt.Errorf("unable to lookup interface %s: %s", route.Device, err)
 	}
 
 	routerNet := route.getNexthopAsIPNet()
 	if routerNet != nil {
 		if _, err := replaceNexthopRoute(route, link, routerNet); err != nil {
-			return false, fmt.Errorf("unable to add nexthop route: %s", err)
+			return fmt.Errorf("unable to add nexthop route: %s", err)
 		}
 
 		nexthopRouteCreated = true
@@ -263,10 +269,10 @@ func Upsert(route Route) (bool, error) {
 		if nexthopRouteCreated {
 			deleteNexthopRoute(route, link, routerNet)
 		}
-		return false, err
+		return err
 	}
 
-	return true, nil
+	return nil
 }
 
 // Delete deletes a Linux route. An error is returned if the route does not
@@ -317,6 +323,9 @@ type Rule struct {
 
 	// Table is the routing table to look up if the rule matches
 	Table int
+
+	// Protocol is the routing rule protocol (e.g. proto unspec/kernel)
+	Protocol uint8
 }
 
 // String returns the string representation of a Rule (adhering to the Stringer
@@ -352,6 +361,8 @@ func (r Rule) String() string {
 		str += fmt.Sprintf(" mark 0x%x mask 0x%x", r.Mark, r.Mask)
 	}
 
+	str += fmt.Sprintf(" proto %s", netlink.RouteProtocol(r.Protocol))
+
 	return str
 }
 
@@ -374,6 +385,10 @@ func lookupRule(spec Rule, family int) (bool, error) {
 		}
 
 		if spec.Mark != 0 && r.Mark != spec.Mark {
+			continue
+		}
+
+		if spec.Protocol != 0 && r.Protocol != spec.Protocol {
 			continue
 		}
 
@@ -444,7 +459,7 @@ func replaceRule(spec Rule, family int) error {
 	if err != nil {
 		return err
 	}
-	if exists == true {
+	if exists {
 		return nil
 	}
 	rule := netlink.NewRule()
@@ -455,20 +470,12 @@ func replaceRule(spec Rule, family int) error {
 	rule.Priority = spec.Priority
 	rule.Src = spec.From
 	rule.Dst = spec.To
+	rule.Protocol = spec.Protocol
 	return netlink.RuleAdd(rule)
 }
 
 // DeleteRule delete a mark based rule from the routing table.
-func DeleteRule(spec Rule) error {
-	return deleteRule(spec, netlink.FAMILY_V4)
-}
-
-// DeleteRuleIPv6 delete a mark based IPv6 rule from the routing table.
-func DeleteRuleIPv6(spec Rule) error {
-	return deleteRule(spec, netlink.FAMILY_V6)
-}
-
-func deleteRule(spec Rule, family int) error {
+func DeleteRule(family int, spec Rule) error {
 	rule := netlink.NewRule()
 	rule.Mark = spec.Mark
 	rule.Mask = spec.Mask
@@ -477,27 +484,25 @@ func deleteRule(spec Rule, family int) error {
 	rule.Src = spec.From
 	rule.Dst = spec.To
 	rule.Family = family
+	rule.Protocol = spec.Protocol
 	return netlink.RuleDel(rule)
 }
 
 func lookupDefaultRoute(family int) (netlink.Route, error) {
-	linkIndex := 0
-
 	routes, err := netlink.RouteListFiltered(family, &netlink.Route{Dst: nil}, netlink.RT_FILTER_DST)
 	if err != nil {
 		return netlink.Route{}, fmt.Errorf("Unable to list direct routes: %s", err)
 	}
 
-	if len(routes) == 0 {
-		return netlink.Route{}, fmt.Errorf("Default route not found for family %d", family)
-	}
+	sort.Slice(routes, func(i, j int) bool {
+		return routes[i].Priority < routes[j].Priority
+	})
 
-	for _, route := range routes {
-		if linkIndex != 0 && linkIndex != route.LinkIndex {
-			return netlink.Route{}, fmt.Errorf("Found default routes with different netdev ifindices: %v vs %v",
-				linkIndex, route.LinkIndex)
-		}
-		linkIndex = route.LinkIndex
+	switch {
+	case len(routes) == 0:
+		return netlink.Route{}, fmt.Errorf("Default route not found for family %d", family)
+	case len(routes) > 1 && routes[0].Priority == routes[1].Priority:
+		return netlink.Route{}, fmt.Errorf("Found multiple default routes with the same priority: %v vs %v", routes[0], routes[1])
 	}
 
 	log.Debugf("Found default route on node %v", routes[0])

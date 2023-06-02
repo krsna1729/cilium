@@ -91,8 +91,6 @@ const (
 	UnallowedPropertyCode
 	FailedAllPatternPropsCode
 	MultipleOfMustBePositiveCode
-	ValidatorRuleFailCode
-	ValidatorRuleExecutionErrorCode
 )
 
 // CompositeError is an error that groups several errors together
@@ -158,31 +156,33 @@ func PropertyNotAllowed(name, in, key string) *Validation {
 }
 
 // TooFewProperties an error for an object with too few properties
-func TooFewProperties(name, in string, n int64) *Validation {
-	msg := fmt.Sprintf(tooFewProperties, name, in, n)
+func TooFewProperties(name, in string, minProperties, size int64) *Validation {
+	msg := fmt.Sprintf(tooFewProperties, name, in, minProperties)
 	if in == "" {
-		msg = fmt.Sprintf(tooFewPropertiesNoIn, name, n)
+		msg = fmt.Sprintf(tooFewPropertiesNoIn, name, minProperties)
 	}
 	return &Validation{
 		code:    TooFewPropertiesCode,
 		Name:    name,
 		In:      in,
-		Value:   n,
+		Value:   size,
+		Valid:   minProperties,
 		message: msg,
 	}
 }
 
 // TooManyProperties an error for an object with too many properties
-func TooManyProperties(name, in string, n int64) *Validation {
-	msg := fmt.Sprintf(tooManyProperties, name, in, n)
+func TooManyProperties(name, in string, maxProperties, size int64) *Validation {
+	msg := fmt.Sprintf(tooManyProperties, name, in, maxProperties)
 	if in == "" {
-		msg = fmt.Sprintf(tooManyPropertiesNoIn, name, n)
+		msg = fmt.Sprintf(tooManyPropertiesNoIn, name, maxProperties)
 	}
 	return &Validation{
 		code:    TooManyPropertiesCode,
 		Name:    name,
 		In:      in,
-		Value:   n,
+		Value:   size,
+		Valid:   maxProperties,
 		message: msg,
 	}
 }
@@ -281,6 +281,7 @@ func TooManyItems(name, in string, max int64, value interface{}) *Validation {
 		Name:    name,
 		In:      in,
 		Value:   value,
+		Valid:   max,
 		message: msg,
 	}
 }
@@ -296,6 +297,7 @@ func TooFewItems(name, in string, min int64, value interface{}) *Validation {
 		Name:    name,
 		In:      in,
 		Value:   value,
+		Valid:   min,
 		message: msg,
 	}
 }
@@ -515,6 +517,7 @@ func TooLong(name, in string, max int64, value interface{}) *Validation {
 		Name:    name,
 		In:      in,
 		Value:   value,
+		Valid:   max,
 		message: msg,
 	}
 }
@@ -533,6 +536,7 @@ func TooShort(name, in string, min int64, value interface{}) *Validation {
 		Name:    name,
 		In:      in,
 		Value:   value,
+		Valid:   min,
 		message: msg,
 	}
 }
@@ -565,37 +569,5 @@ func MultipleOfMustBePositive(name, in string, factor interface{}) *Validation {
 		In:      in,
 		Value:   factor,
 		message: fmt.Sprintf(multipleOfMustBePositive, name, factor),
-	}
-}
-
-// FailedValidatorRule error for when a value fails a x-kubernetes-validations rule.
-func FailedValidatorRule(name, in, rule, message string, value interface{}) *Validation {
-	var msg string
-	if message != "" {
-		// If x-kubernetes-validations rule provided a custom message, use it.
-		msg = fmt.Sprintf("%s: %s", name, message)
-	} else {
-		msg = fmt.Sprintf("%s failed validator rule '%s'", name, rule)
-	}
-
-	return &Validation{
-		code:    ValidatorRuleFailCode,
-		Name:    name,
-		In:      in,
-		Value:   value,
-		message: msg,
-	}
-}
-
-// ErrorExecutingValidatorRule error for when execution of a x-kubernetes-validations rule results in an error.
-func ErrorExecutingValidatorRule(name, in, rule string, err error, value interface{}) *Validation {
-	var msg = fmt.Sprintf("%s failed to execute validator rule '%s' due to error: %v", name, rule, err)
-
-	return &Validation{
-		code:    ValidatorRuleExecutionErrorCode,
-		Name:    name,
-		In:      in,
-		Value:   value,
-		message: msg,
 	}
 }

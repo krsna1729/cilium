@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package allocator
 
@@ -7,12 +7,12 @@ import (
 	"errors"
 	"net"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/cilium/cilium/pkg/ipam/types"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -59,12 +59,18 @@ func (g *PoolGroupAllocator) ReserveAddresses(iterator AddressIterator) {
 		ip := net.ParseIP(ipString)
 		if ip != nil {
 			if err := g.Allocate(types.PoolID(poolID), ip); err != nil {
-				log.WithFields(logrus.Fields{"instance": instanceID, "interface": interfaceID, "ip": ipString}).
-					WithError(err).Warning("Unable to allocate IP in internal allocator")
+				log.WithFields(logrus.Fields{
+					"instance":  instanceID,
+					"interface": interfaceID,
+					"ip":        ipString,
+				}).WithError(err).Warning("Unable to allocate IP in internal allocator")
 			}
 		} else {
-			log.WithFields(logrus.Fields{"instance": instanceID, "interface": interfaceID, "ip": ipString}).
-				Warning("Unable to parse IP")
+			log.WithFields(logrus.Fields{
+				"instance":  instanceID,
+				"interface": interfaceID,
+				"ip":        ipString,
+			}).Warning("Unable to parse IP")
 		}
 		return nil
 	})
@@ -136,36 +142,4 @@ func (g *PoolGroupAllocator) getAllocator(poolID types.PoolID) *PoolAllocator {
 	defer g.mutex.RUnlock()
 
 	return g.allocators[poolID]
-}
-
-// FirstPoolWithAvailableQuota returns the first pool ID in the list of pools
-// with available addresses. If any of the preferred pool IDs have available
-// addresses, the first pool in that list is returned.
-func (g *PoolGroupAllocator) FirstPoolWithAvailableQuota(preferredPoolIDs []types.PoolID) (types.PoolID, int) {
-	g.mutex.RLock()
-	defer g.mutex.RUnlock()
-
-	for _, p := range preferredPoolIDs {
-		if allocator := g.allocators[p]; allocator != nil {
-			if available := allocator.Free(); available > 0 {
-				return p, available
-			}
-		}
-	}
-
-	for poolID, allocator := range g.allocators {
-		if available := allocator.Free(); available > 0 {
-			return poolID, available
-		}
-	}
-
-	return types.PoolNotExists, 0
-}
-
-// PoolExists returns true if an allocation pool exists.
-func (g *PoolGroupAllocator) PoolExists(poolID types.PoolID) bool {
-	g.mutex.RLock()
-	_, ok := g.allocators[poolID]
-	g.mutex.RUnlock()
-	return ok
 }

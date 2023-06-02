@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of Cilium
+// Copyright Authors of Cilium
 
 package ebpf
 
@@ -9,26 +9,30 @@ import (
 	"os"
 	"path/filepath"
 
+	ciliumebpf "github.com/cilium/ebpf"
+
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/lock"
-
-	ciliumebpf "github.com/cilium/ebpf"
 )
 
 type MapSpec = ciliumebpf.MapSpec
 
+type PinType = ciliumebpf.PinType
+
 const (
+	Hash       = ciliumebpf.Hash
 	PerCPUHash = ciliumebpf.PerCPUHash
 	Array      = ciliumebpf.Array
 	HashOfMaps = ciliumebpf.HashOfMaps
+	LPMTrie    = ciliumebpf.LPMTrie
 
+	PinNone   = ciliumebpf.PinNone
 	PinByName = ciliumebpf.PinByName
 )
 
 var (
 	ErrKeyNotExist = ciliumebpf.ErrKeyNotExist
-	LoadPinnedMap  = ciliumebpf.LoadPinnedMap
 )
 
 // IterateCallback represents the signature of the callback function expected by
@@ -52,24 +56,32 @@ func NewMap(spec *MapSpec) *Map {
 	}
 }
 
-// OpenMap opens the given bpf map and generates the Map object based on the
-// information stored in the bpf map.
-func OpenMap(mapName string) (*Map, error) {
+// LoadRegisterMap loads the specified map from a bpffs pin path and registers
+// its handle in the package-global map register.
+func LoadRegisterMap(mapName string) (*Map, error) {
 	path := bpf.MapPath(mapName)
 
-	newMap, err := LoadPinnedMap(path, nil)
+	m, err := LoadPinnedMap(path)
 	if err != nil {
 		return nil, err
-	}
-
-	m := &Map{
-		Map:  newMap,
-		path: path,
 	}
 
 	registerMap(m)
 
 	return m, nil
+}
+
+// LoadPinnedMap wraps cilium/ebpf's LoadPinnedMap.
+func LoadPinnedMap(fileName string) (*Map, error) {
+	m, err := ciliumebpf.LoadPinnedMap(fileName, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Map{
+		Map:  m,
+		path: fileName,
+	}, nil
 }
 
 func MapFromID(id int) (*Map, error) {
@@ -98,11 +110,10 @@ func (m *Map) OpenOrCreate() error {
 	}
 
 	opts := ciliumebpf.MapOptions{
-		PinPath: bpf.MapPrefixPath(),
+		PinPath: bpf.TCGlobalsPath(),
 	}
 
-	mapType := bpf.GetMapType(bpf.MapType(m.spec.Type))
-	m.spec.Flags = m.spec.Flags | bpf.GetPreAllocateMapFlags(mapType)
+	m.spec.Flags = m.spec.Flags | bpf.GetPreAllocateMapFlags(bpf.MapType(m.spec.Type))
 
 	path := bpf.MapPath(m.spec.Name)
 

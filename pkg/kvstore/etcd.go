@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package kvstore
 
@@ -13,9 +13,20 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
+	"github.com/blang/semver/v4"
+	"github.com/sirupsen/logrus"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	v3rpcErrors "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
+	"go.etcd.io/etcd/client/pkg/v3/tlsutil"
+	client "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
+	clientyaml "go.etcd.io/etcd/client/v3/yaml"
+	"golang.org/x/time/rate"
+	"sigs.k8s.io/yaml"
+
+	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/contexthelpers"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/defaults"
@@ -25,16 +36,6 @@ import (
 	"github.com/cilium/cilium/pkg/rand"
 	"github.com/cilium/cilium/pkg/spanstat"
 	"github.com/cilium/cilium/pkg/versioncheck"
-
-	"github.com/blang/semver/v4"
-	"github.com/sirupsen/logrus"
-	v3rpcErrors "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
-	"go.etcd.io/etcd/client/pkg/v3/tlsutil"
-	client "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/client/v3/concurrency"
-	clientyaml "go.etcd.io/etcd/client/v3/yaml"
-	"golang.org/x/time/rate"
-	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -44,13 +45,20 @@ const (
 	EtcdAddrOption               = "etcd.address"
 	isEtcdOperatorOption         = "etcd.operator"
 	EtcdOptionConfig             = "etcd.config"
-	etcdOptionKeepAliveHeartbeat = "etcd.keepaliveHeartbeat"
-	etcdOptionKeepAliveTimeout   = "etcd.keepaliveTimeout"
+	EtcdOptionKeepAliveHeartbeat = "etcd.keepaliveHeartbeat"
+	EtcdOptionKeepAliveTimeout   = "etcd.keepaliveTimeout"
 
 	// EtcdRateLimitOption specifies maximum kv operations per second
 	EtcdRateLimitOption = "etcd.qps"
 
+	// EtcdListLimitOption limits the number of results retrieved in one batch
+	// by ListAndWatch operations. A 0 value equals to no limit.
+	EtcdListLimitOption = "etcd.limit"
+
 	minRequiredVersionStr = ">=3.1.0"
+
+	etcdSessionRenewNamePrefix     = "kvstore-etcd-session-renew"
+	etcdLockSessionRenewNamePrefix = "kvstore-etcd-lock-session-renew"
 )
 
 var (
@@ -66,13 +74,12 @@ type etcdModule struct {
 	config *client.Config
 }
 
-var (
-	// versionCheckTimeout is the time we wait trying to verify the version
-	// of an etcd endpoint. The timeout can be encountered on network
-	// connectivity problems.
-	// This field needs to be accessed with the atomic library.
-	versionCheckTimeout = int64(30 * time.Second)
+// versionCheckTimeout is the time we wait trying to verify the version
+// of an etcd endpoint. The timeout can be encountered on network
+// connectivity problems.
+const versionCheckTimeout = 30 * time.Second
 
+var (
 	// statusCheckTimeout is the timeout when performing status checks with
 	// all etcd endpoints
 	statusCheckTimeout = 10 * time.Second
@@ -105,14 +112,14 @@ func newEtcdModule() backendModule {
 			EtcdOptionConfig: &backendOption{
 				description: "Path to etcd configuration file",
 			},
-			etcdOptionKeepAliveTimeout: &backendOption{
+			EtcdOptionKeepAliveTimeout: &backendOption{
 				description: "Timeout after which an unanswered heartbeat triggers the connection to be closed",
 				validate: func(v string) error {
 					_, err := time.ParseDuration(v)
 					return err
 				},
 			},
-			etcdOptionKeepAliveHeartbeat: &backendOption{
+			EtcdOptionKeepAliveHeartbeat: &backendOption{
 				description: "Heartbeat interval to keep gRPC connection alive",
 				validate: func(v string) error {
 					_, err := time.ParseDuration(v)
@@ -121,6 +128,13 @@ func newEtcdModule() backendModule {
 			},
 			EtcdRateLimitOption: &backendOption{
 				description: "Rate limit in kv store operations per second",
+				validate: func(v string) error {
+					_, err := strconv.Atoi(v)
+					return err
+				},
+			},
+			EtcdListLimitOption: &backendOption{
+				description: "Max number of results retrieved in one batch by ListAndWatch operations (0 = no limit)",
 				validate: func(v string) error {
 					_, err := strconv.Atoi(v)
 					return err
@@ -169,6 +183,7 @@ type clientOptions struct {
 	KeepAliveHeartbeat time.Duration
 	KeepAliveTimeout   time.Duration
 	RateLimit          int
+	ListBatchSize      int
 }
 
 func (e *etcdModule) newClient(ctx context.Context, opts *ExtraOptions) (BackendOperations, chan error) {
@@ -178,17 +193,22 @@ func (e *etcdModule) newClient(ctx context.Context, opts *ExtraOptions) (Backend
 		KeepAliveHeartbeat: 15 * time.Second,
 		KeepAliveTimeout:   25 * time.Second,
 		RateLimit:          defaults.KVstoreQPS,
+		ListBatchSize:      256,
 	}
 
 	if o, ok := e.opts[EtcdRateLimitOption]; ok && o.value != "" {
 		clientOptions.RateLimit, _ = strconv.Atoi(o.value)
 	}
 
-	if o, ok := e.opts[etcdOptionKeepAliveTimeout]; ok && o.value != "" {
+	if o, ok := e.opts[EtcdListLimitOption]; ok && o.value != "" {
+		clientOptions.ListBatchSize, _ = strconv.Atoi(o.value)
+	}
+
+	if o, ok := e.opts[EtcdOptionKeepAliveTimeout]; ok && o.value != "" {
 		clientOptions.KeepAliveTimeout, _ = time.ParseDuration(o.value)
 	}
 
-	if o, ok := e.opts[etcdOptionKeepAliveHeartbeat]; ok && o.value != "" {
+	if o, ok := e.opts[EtcdOptionKeepAliveHeartbeat]; ok && o.value != "" {
 		clientOptions.KeepAliveHeartbeat, _ = time.ParseDuration(o.value)
 	}
 
@@ -225,6 +245,7 @@ func (e *etcdModule) newClient(ctx context.Context, opts *ExtraOptions) (Backend
 		"KeepAliveHeartbeat": clientOptions.KeepAliveHeartbeat,
 		"KeepAliveTimeout":   clientOptions.KeepAliveTimeout,
 		"RateLimit":          clientOptions.RateLimit,
+		"ListLimit":          clientOptions.ListBatchSize,
 	}).Info("Creating etcd client")
 
 	for {
@@ -309,7 +330,8 @@ type etcdClient struct {
 
 	extraOptions *ExtraOptions
 
-	limiter *rate.Limiter
+	limiter       *rate.Limiter
+	listBatchSize int
 
 	lastHeartbeat time.Time
 }
@@ -571,7 +593,7 @@ func (e *etcdClient) renewSession(ctx context.Context) error {
 		return fmt.Errorf("unable to renew etcd session: %s", err)
 	}
 	sessionSuccess <- true
-	log.Infof("Got new lease ID %x", newSession.Lease())
+	log.Infof("Got new lease ID %x and the session TTL is %s", newSession.Lease(), option.Config.KVstoreLeaseTTL)
 
 	e.session = newSession
 	e.sessionCancel = sessionCancel
@@ -579,7 +601,7 @@ func (e *etcdClient) renewSession(ctx context.Context) error {
 
 	e.getLogger().WithField(fieldSession, newSession).Debug("Renewing etcd session")
 
-	if err := e.checkMinVersion(ctx); err != nil {
+	if err := e.checkMinVersion(ctx, versionCheckTimeout); err != nil {
 		return err
 	}
 
@@ -667,6 +689,8 @@ func connectEtcdClient(ctx context.Context, config *client.Config, cfgPath strin
 		shuffleEndpoints(config.Endpoints)
 	}
 
+	// Set client context so that client can be cancelled from outside
+	config.Context = ctx
 	// Set DialTimeout to 0, otherwise the creation of a new client will
 	// block until DialTimeout is reached or a connection to the server
 	// is made.
@@ -701,6 +725,7 @@ func connectEtcdClient(ctx context.Context, config *client.Config, cfgPath strin
 		stopStatusChecker:    make(chan struct{}),
 		extraOptions:         opts,
 		limiter:              rate.NewLimiter(rate.Limit(clientOptions.RateLimit), clientOptions.RateLimit),
+		listBatchSize:        clientOptions.ListBatchSize,
 		statusCheckErrors:    make(chan error, 128),
 	}
 
@@ -724,7 +749,7 @@ func connectEtcdClient(ctx context.Context, config *client.Config, cfgPath strin
 		ls = *lockSession
 		ec.RWMutex.Unlock()
 
-		log.Infof("Got lease ID %x", s.Lease())
+		log.Infof("Got lease ID %x and the session TTL is %s", s.Lease(), option.Config.KVstoreLeaseTTL)
 		log.Infof("Got lock lease ID %x", ls.Lease())
 		close(errorChan)
 	}()
@@ -754,7 +779,7 @@ func connectEtcdClient(ctx context.Context, config *client.Config, cfgPath strin
 
 		ec.getLogger().Info("Initial etcd session established")
 
-		if err := ec.checkMinVersion(ctx); err != nil {
+		if err := ec.checkMinVersion(ctx, versionCheckTimeout); err != nil {
 			handleSessionError(fmt.Errorf("unable to validate etcd version: %s", err))
 		}
 	}()
@@ -781,13 +806,15 @@ func connectEtcdClient(ctx context.Context, config *client.Config, cfgPath strin
 				ec.lastHeartbeat = time.Now()
 				ec.RWMutex.Unlock()
 				log.Debug("Received update notification of heartbeat")
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 
 	go ec.statusChecker()
 
-	ec.controllers.UpdateController("kvstore-etcd-session-renew",
+	ec.controllers.UpdateController(makeSessionName(etcdSessionRenewNamePrefix, opts),
 		controller.ControllerParams{
 			// Stop controller function when etcd client is terminating
 			Context: ec.client.Ctx(),
@@ -798,7 +825,7 @@ func connectEtcdClient(ctx context.Context, config *client.Config, cfgPath strin
 		},
 	)
 
-	ec.controllers.UpdateController("kvstore-etcd-lock-session-renew",
+	ec.controllers.UpdateController(makeSessionName(etcdLockSessionRenewNamePrefix, opts),
 		controller.ControllerParams{
 			// Stop controller function when etcd client is terminating
 			Context: ec.client.Ctx(),
@@ -810,6 +837,15 @@ func connectEtcdClient(ctx context.Context, config *client.Config, cfgPath strin
 	)
 
 	return ec, nil
+}
+
+// makeSessionName builds up a session/locksession controller name
+// clusterName is expected to be empty for main kvstore connection
+func makeSessionName(sessionPrefix string, opts *ExtraOptions) string {
+	if opts != nil && opts.ClusterName != "" {
+		return fmt.Sprintf("%s-%s", sessionPrefix, opts.ClusterName)
+	}
+	return sessionPrefix
 }
 
 func getEPVersion(ctx context.Context, c client.Maintenance, etcdEP string, timeout time.Duration) (semver.Version, error) {
@@ -836,12 +872,11 @@ func (e *etcdClient) sessionError() (err error) {
 // checkMinVersion checks the minimal version running on etcd cluster.  This
 // function should be run whenever the etcd client is connected for the first
 // time and whenever the session is renewed.
-func (e *etcdClient) checkMinVersion(ctx context.Context) error {
+func (e *etcdClient) checkMinVersion(ctx context.Context, timeout time.Duration) error {
 	eps := e.client.Endpoints()
 
 	for _, ep := range eps {
-		vcTimeout := atomic.LoadInt64(&versionCheckTimeout)
-		v, err := getEPVersion(ctx, e.client.Maintenance, ep, time.Duration(vcTimeout))
+		v, err := getEPVersion(ctx, e.client.Maintenance, ep, timeout)
 		if err != nil {
 			e.getLogger().WithError(Hint(err)).WithField(fieldEtcdEndpoint, ep).
 				Warn("Unable to verify version of etcd endpoint")
@@ -919,6 +954,19 @@ func (e *etcdClient) Watch(ctx context.Context, w *Watcher) {
 	localCache := watcherCache{}
 	listSignalSent := false
 
+	defer func() {
+		close(w.Events)
+		w.stopWait.Done()
+
+		// The watch might be aborted by closing
+		// the context instead of calling
+		// w.Stop() from outside. In that case
+		// we make sure to close everything and
+		// as this uses sync.Once it can be
+		// run multiple times (if that's the case).
+		w.Stop()
+	}()
+
 	scopedLog := e.getLogger().WithFields(logrus.Fields{
 		fieldWatcher: w,
 		fieldPrefix:  w.Prefix,
@@ -929,6 +977,19 @@ func (e *etcdClient) Watch(ctx context.Context, w *Watcher) {
 		// The context ended or the etcd client was closed
 		// before connectivity was achieved
 		return
+	}
+
+	// errLimiter is used to rate limit the retry of the first Get request in case an error
+	// has occurred, to prevent overloading the etcd server due to the more aggressive
+	// default rate limiter.
+	errLimiter := backoff.Exponential{
+		Name: "etcd-list-before-watch-error",
+		Min:  50 * time.Millisecond,
+		Max:  1 * time.Minute,
+	}
+
+	if e.extraOptions != nil {
+		errLimiter.NodeManager = backoff.NewNodeManager(e.extraOptions.ClusterSizeDependantInterval)
 	}
 
 reList:
@@ -942,40 +1003,33 @@ reList:
 		}
 
 		e.limiter.Wait(ctx)
-		res, err := e.client.Get(ctx, w.Prefix, client.WithPrefix(),
-			client.WithSerializable())
+		kvs, revision, err := e.paginatedList(ctx, scopedLog, w.Prefix)
 		if err != nil {
 			scopedLog.WithError(Hint(err)).Warn("Unable to list keys before starting watcher")
+			errLimiter.Wait(ctx)
 			continue
 		}
+		errLimiter.Reset()
 
-		nextRev := res.Header.Revision + 1
-		scopedLog.Debugf("List response from etcd len=%d: %+v", res.Count, res)
-
-		if res.Count > 0 {
-			for _, key := range res.Kvs {
-				t := EventTypeCreate
-				if localCache.Exists(key.Key) {
-					t = EventTypeModify
-				}
-
-				localCache.MarkInUse(key.Key)
-				scopedLog.Debugf("Emitting list result as %v event for %s=%v", t, key.Key, key.Value)
-
-				queueStart := spanstat.Start()
-				w.Events <- KeyValueEvent{
-					Key:   string(key.Key),
-					Value: key.Value,
-					Typ:   t,
-				}
-				trackEventQueued(string(key.Key), t, queueStart.End(true).Total())
+		for _, key := range kvs {
+			t := EventTypeCreate
+			if localCache.Exists(key.Key) {
+				t = EventTypeModify
 			}
+
+			localCache.MarkInUse(key.Key)
+			scopedLog.Debugf("Emitting list result as %s event for %s=%s", t, key.Key, key.Value)
+
+			queueStart := spanstat.Start()
+			w.Events <- KeyValueEvent{
+				Key:   string(key.Key),
+				Value: key.Value,
+				Typ:   t,
+			}
+			trackEventQueued(string(key.Key), t, queueStart.End(true).Total())
 		}
 
-		// More keys to be read, call Get() again
-		if res.More {
-			continue
-		}
+		nextRev := revision + 1
 
 		// Send out deletion events for all keys that were deleted
 		// between our last known revision and the latest revision
@@ -1002,7 +1056,7 @@ reList:
 		scopedLog.WithField(fieldRev, nextRev).Debug("Starting to watch a prefix")
 
 		e.limiter.Wait(ctx)
-		etcdWatch := e.client.Watch(ctx, w.Prefix,
+		etcdWatch := e.client.Watch(client.WithRequireLeader(ctx), w.Prefix,
 			client.WithPrefix(), client.WithRev(nextRev))
 		for {
 			select {
@@ -1011,10 +1065,7 @@ reList:
 			case <-ctx.Done():
 				return
 			case <-w.stopWatch:
-				close(w.Events)
-				w.stopWait.Done()
 				return
-
 			case r, ok := <-etcdWatch:
 				if !ok {
 					time.Sleep(50 * time.Millisecond)
@@ -1061,7 +1112,7 @@ reList:
 						localCache.MarkInUse(ev.Kv.Key)
 					}
 
-					scopedLog.Debugf("Emitting %v event for %s=%v", event.Typ, event.Key, event.Value)
+					scopedLog.Debugf("Emitting %s event for %s=%s", event.Typ, event.Key, event.Value)
 
 					queueStart := spanstat.Start()
 					w.Events <- event
@@ -1069,6 +1120,39 @@ reList:
 				}
 			}
 		}
+	}
+}
+
+func (e *etcdClient) paginatedList(ctx context.Context, log *logrus.Entry, prefix string) (kvs []*mvccpb.KeyValue, revision int64, err error) {
+	start, end := prefix, client.GetPrefixRangeEnd(prefix)
+
+	for {
+		res, err := e.client.Get(ctx, start, client.WithRange(end),
+			client.WithSort(client.SortByKey, client.SortAscend),
+			client.WithRev(revision), client.WithSerializable(),
+			client.WithLimit(int64(e.listBatchSize)),
+		)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		log.WithFields(logrus.Fields{
+			fieldNumEntries:       len(res.Kvs),
+			fieldRemainingEntries: res.Count - int64(len(res.Kvs)),
+		}).Debug("Received list response from etcd")
+
+		if kvs == nil {
+			kvs = make([]*mvccpb.KeyValue, 0, res.Count)
+		}
+
+		kvs = append(kvs, res.Kvs...)
+
+		revision = res.Header.Revision
+		if !res.More || len(res.Kvs) == 0 {
+			return kvs, revision, nil
+		}
+
+		start = string(res.Kvs[len(res.Kvs)-1].Key) + "\x00"
 	}
 }
 
@@ -1156,7 +1240,13 @@ func (e *etcdClient) statusChecker() {
 
 		e.statusLock.Unlock()
 		if e.latestErrorStatus != nil {
-			e.statusCheckErrors <- e.latestErrorStatus
+			select {
+			case e.statusCheckErrors <- e.latestErrorStatus:
+			default:
+				// Channel's buffer is full, skip sending errors to the channel but log warnings instead
+				log.WithError(e.latestErrorStatus).
+					Warning("Status check error channel is full, dropping this error")
+			}
 		}
 
 		select {
@@ -1312,7 +1402,7 @@ func (e *etcdClient) createOpPut(key string, value []byte, leaseID client.LeaseI
 	return &op
 }
 
-// UpdateIfLocked atomically creates a key or fails if it already exists if the client is still holding the given lock.
+// UpdateIfLocked updates a key if the client is still holding the given lock.
 func (e *etcdClient) UpdateIfLocked(ctx context.Context, key string, value []byte, lease bool, lock KVLocker) error {
 	if err := e.waitForInitialSession(ctx); err != nil {
 		return err
@@ -1400,9 +1490,7 @@ func (e *etcdClient) UpdateIfDifferentIfLocked(ctx context.Context, key string, 
 	}
 
 	if lease {
-		e.RWMutex.RLock()
-		leaseID := e.session.Lease()
-		e.RWMutex.RUnlock()
+		leaseID := e.GetSessionLeaseID()
 		if getR.Kvs[0].Lease != int64(leaseID) {
 			return true, e.UpdateIfLocked(ctx, key, value, lease, lock)
 		}
@@ -1434,9 +1522,7 @@ func (e *etcdClient) UpdateIfDifferent(ctx context.Context, key string, value []
 		return true, e.Update(ctx, key, value, lease)
 	}
 	if lease {
-		e.RWMutex.RLock()
-		leaseID := e.session.Lease()
-		e.RWMutex.RUnlock()
+		leaseID := e.GetSessionLeaseID()
 		if getR.Kvs[0].Lease != int64(leaseID) {
 			return true, e.Update(ctx, key, value, lease)
 		}
@@ -1637,9 +1723,9 @@ func (e *etcdClient) ListPrefix(ctx context.Context, prefix string) (v KeyValueP
 }
 
 // Close closes the etcd session
-func (e *etcdClient) Close() {
+func (e *etcdClient) Close(ctx context.Context) {
 	close(e.stopStatusChecker)
-	sessionErr := e.waitForInitialSession(context.Background())
+	sessionErr := e.waitForInitialSession(ctx)
 	if e.controllers != nil {
 		e.controllers.RemoveAll()
 	}
@@ -1690,6 +1776,49 @@ func (e *etcdClient) ListAndWatch(ctx context.Context, name, prefix string, chan
 	go e.Watch(ctx, w)
 
 	return w
+}
+
+// UserEnforcePresence creates a user in etcd if not already present, and grants the specified roles.
+func (e *etcdClient) UserEnforcePresence(ctx context.Context, name string, roles []string) error {
+	scopedLog := e.getLogger().WithField(FieldUser, name)
+
+	scopedLog.Debug("Creating user")
+	_, err := e.client.Auth.UserAddWithOptions(ctx, name, "", &client.UserAddOptions{NoPassword: true})
+	if err != nil {
+		if errors.Is(err, v3rpcErrors.ErrUserAlreadyExist) {
+			scopedLog.Debug("User already exists")
+		} else {
+			return err
+		}
+	}
+
+	for _, role := range roles {
+		scopedLog.WithField(FieldRole, role).Debug("Granting role to user")
+
+		_, err := e.client.Auth.UserGrantRole(ctx, name, role)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// UserEnforcePresence deletes a user from etcd, if present.
+func (e *etcdClient) UserEnforceAbsence(ctx context.Context, name string) error {
+	scopedLog := e.getLogger().WithField(FieldUser, name)
+
+	scopedLog.Debug("Deleting user")
+	_, err := e.client.Auth.UserDelete(ctx, name)
+	if err != nil {
+		if errors.Is(err, v3rpcErrors.ErrUserNotFound) {
+			scopedLog.Debug("User not found")
+		} else {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // SplitK8sServiceURL returns the service name and namespace for the given address.

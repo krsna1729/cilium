@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2021 Authors of Cilium
-
-//go:build !privileged_tests && integration_tests
-// +build !privileged_tests,integration_tests
+// Copyright Authors of Cilium
 
 package endpoint
 
@@ -11,6 +8,8 @@ import (
 	"fmt"
 	"reflect"
 	"time"
+
+	check "github.com/cilium/checkmate"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/checker"
@@ -21,8 +20,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/trafficdirection"
-
-	"gopkg.in/check.v1"
+	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
 )
 
 var (
@@ -49,7 +47,7 @@ func (e endpointStatusConfiguration) EndpointStatusIsEnabled(name string) bool {
 }
 
 func (s *EndpointSuite) newEndpoint(c *check.C, spec endpointGeneratorSpec) *Endpoint {
-	e, err := NewEndpointFromChangeModel(context.TODO(), s, &FakeEndpointProxy{}, s.mgr, &models.EndpointChangeRequest{
+	e, err := NewEndpointFromChangeModel(context.TODO(), s, s, testipcache.NewMockIPCache(), &FakeEndpointProxy{}, s.mgr, &models.EndpointChangeRequest{
 		Addressing: &models.AddressPair{},
 		ID:         200,
 		Labels: models.Labels{
@@ -58,7 +56,7 @@ func (s *EndpointSuite) newEndpoint(c *check.C, spec endpointGeneratorSpec) *End
 			"k8s:io.kubernetes.pod.namespace=default",
 			"k8s:name=probe",
 		},
-		State: models.EndpointState("waiting-for-identity"),
+		State: models.EndpointStateWaitingDashForDashIdentity.Pointer(),
 	})
 	c.Assert(err, check.IsNil)
 
@@ -261,9 +259,9 @@ func (s *EndpointSuite) TestgetEndpointPolicyMapState(c *check.C) {
 	c.Assert(apiPolicy.Egress.Allowed, checker.DeepEquals, allowAllIdentityList)
 
 	fooLbls := labels.Labels{"": labels.ParseLabel("foo")}
-	fooIdentity, _, err := e.allocator.AllocateIdentity(context.Background(), fooLbls, false)
+	fooIdentity, _, err := e.allocator.AllocateIdentity(context.Background(), fooLbls, false, identity.InvalidIdentity)
 	c.Assert(err, check.Equals, nil)
-	defer s.mgr.Release(context.Background(), fooIdentity)
+	defer s.mgr.Release(context.Background(), fooIdentity, false)
 
 	e.desiredPolicy = policy.NewEndpointPolicy(s.repo)
 	e.desiredPolicy.IngressPolicyEnabled = true
@@ -427,9 +425,9 @@ func (s *EndpointSuite) TestEndpointPolicyStatus(c *check.C) {
 		{false, true, false, models.EndpointPolicyEnabledEgress},
 		{true, true, false, models.EndpointPolicyEnabledBoth},
 		{false, false, true, models.EndpointPolicyEnabledNone},
-		{true, false, true, models.EndpointPolicyEnabledAuditIngress},
-		{false, true, true, models.EndpointPolicyEnabledAuditEgress},
-		{true, true, true, models.EndpointPolicyEnabledAuditBoth},
+		{true, false, true, models.EndpointPolicyEnabledAuditDashIngress},
+		{false, true, true, models.EndpointPolicyEnabledAuditDashEgress},
+		{true, true, true, models.EndpointPolicyEnabledAuditDashBoth},
 	}
 
 	e := s.newEndpoint(c, endpointGeneratorSpec{})

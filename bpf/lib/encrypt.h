@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright (C) 2020 Authors of Cilium */
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Cilium */
 
 #ifndef __LIB_ENCRYPT_H_
 #define __LIB_ENCRYPT_H_
@@ -70,7 +70,7 @@ do_decrypt(struct __ctx_buff *ctx, __u16 proto)
 #ifdef ENABLE_ENDPOINT_ROUTES
 	return CTX_ACT_OK;
 #else
-	return redirect(CILIUM_IFINDEX, 0);
+	return ctx_redirect(ctx, CILIUM_IFINDEX, 0);
 #endif /* ENABLE_ROUTING */
 }
 #else

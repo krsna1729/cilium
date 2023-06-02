@@ -18,20 +18,22 @@ service map.
 
 .. note::
 
-   This guide assumes that Cilium has been correctly installed in your
-   Kubernetes cluster and that Hubble has been enabled. Please see
-   :ref:`k8s_quick_install` and :ref:`hubble_setup` for more information. If
-   unsure, run ``cilium status`` and validate that Cilium and Hubble are up and
-   running.
+   This guide assumes that Cilium and Hubble have been correctly installed in your
+   Kubernetes cluster. Please see :ref:`k8s_quick_install` and :ref:`hubble_setup`
+   for more information. If unsure, run ``cilium status`` and validate that Cilium
+   and Hubble are installed.
 
 Enable the Hubble UI
 ====================
 
-If you have not done so already, enable the Hubble UI by running the following command:
+Enable the Hubble UI by running the following command:
 
 .. tabs::
 
     .. group-tab:: Cilium CLI 
+
+        If Hubble is already enabled with ``cilium hubble enable``, you must first temporarily disable Hubble with ``cilium hubble disable``.
+        This is because the Hubble UI cannot be added at runtime.
 
         .. code-block:: shell-session
 
@@ -79,28 +81,28 @@ If you have not done so already, enable the Hubble UI by running the following c
                   server:
                     # set this to true if tls is enabled on Hubble relay server side
                     enabled: true
-            ui:
-              # enable Hubble UI
-              enabled: true
-              standalone:
-                # enable Hubble UI standalone deployment
+              ui:
+                # enable Hubble UI
                 enabled: true
-                # provide a volume containing Hubble relay client certificates to mount in Hubble UI pod
-                certsVolume:
-                  projected:
-                    defaultMode: 0400
-                    sources:
-                      - secret:
-                          name: my-hubble-ui-client-certs
-                          items:
-                            - key: tls.crt
-                              path: client.crt
-                            - key: tls.key
-                              path: client.key
-                            - key: ca.crt
-                              path: hubble-relay-ca.crt
+                standalone:
+                  # enable Hubble UI standalone deployment
+                  enabled: true
+                  # provide a volume containing Hubble relay client certificates to mount in Hubble UI pod
+                  tls:
+                    certsVolume:
+                      projected:
+                        defaultMode: 0400
+                        sources:
+                          - secret:
+                              name: my-hubble-ui-client-certs
+                              items:
+                                - key: tls.crt
+                                  path: client.crt
+                                - key: tls.key
+                                  path: client.key
+                                - key: ca.crt
+                                  path: hubble-relay-ca.crt
             EOF
-
 
         Please note that Hubble UI expects the certificate files to be available under the following paths:
 

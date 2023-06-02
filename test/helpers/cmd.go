@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2017 Authors of Cilium
+// Copyright Authors of Cilium
 
 package helpers
 
@@ -14,11 +14,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cilium/cilium/test/logger"
-
 	"github.com/onsi/gomega"
 	"github.com/onsi/gomega/types"
 	"k8s.io/client-go/util/jsonpath"
+
+	"github.com/cilium/cilium/test/logger"
 )
 
 // CmdStreamBuffer is a buffer that buffers the stream output of a command.
@@ -48,12 +48,13 @@ func (b *CmdStreamBuffer) ByLines() []string {
 // KVOutput returns a map of the stdout of res split based on
 // the separator '='.
 // For example, the following strings would be split as follows:
-//             a=1
-//             b=2
-//             c=3
-//             a=1
-//             b=2
-//             c=3
+//
+//	a=1
+//	b=2
+//	c=3
+//	a=1
+//	b=2
+//	c=3
 func (b *CmdStreamBuffer) KVOutput() map[string]string {
 	result := make(map[string]string)
 	for _, line := range b.ByLines() {
@@ -126,7 +127,6 @@ func (b *CmdStreamBuffer) FilterLines(filter string) ([]FilterBuffer, error) {
 // CmdRes contains a variety of data which results from running a command.
 type CmdRes struct {
 	cmd      string          // Command to run
-	params   []string        // Parameters to provide to command
 	stdout   *Buffer         // Stdout from running cmd
 	stderr   *Buffer         // Stderr from running cmd
 	success  bool            // Whether command successfully executed
@@ -376,9 +376,10 @@ func (res *CmdRes) ByLines() []string {
 // KVOutput returns a map of the stdout of res split based on
 // the separator '='.
 // For example, the following strings would be split as follows:
-//		a=1
-//		b=2
-//		c=3
+//
+//	a=1
+//	b=2
+//	c=3
 func (res *CmdRes) KVOutput() map[string]string {
 	return res.GetStdOut().KVOutput()
 }
@@ -440,6 +441,12 @@ func (res *CmdRes) GetDebugMessage() string {
 // WaitUntilMatch waits until the given substring is present in the `CmdRes.stdout`
 // If the timeout is reached it will return an error.
 func (res *CmdRes) WaitUntilMatch(substr string) error {
+	return res.WaitUntilMatchTimeout(substr, HelperTimeout)
+}
+
+// WaitUntilMatchTimeout is the same as WaitUntilMatch but with a user-provided
+// timeout value.
+func (res *CmdRes) WaitUntilMatchTimeout(substr string, timeout time.Duration) error {
 	body := func() bool {
 		return strings.Contains(res.OutputPrettyPrint(), substr)
 	}
@@ -447,7 +454,7 @@ func (res *CmdRes) WaitUntilMatch(substr string) error {
 	return WithTimeout(
 		body,
 		fmt.Sprintf("%s is not in the output after timeout", substr),
-		&TimeoutConfig{Timeout: HelperTimeout})
+		&TimeoutConfig{Timeout: timeout})
 }
 
 // WaitUntilMatchRegexp waits until the `CmdRes.stdout` matches the given regexp.

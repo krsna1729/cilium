@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Authors of Cilium
+// Copyright Authors of Cilium
 
 package mock
 
 import (
-	"github.com/cilium/cilium/pkg/cidr"
-	"github.com/cilium/cilium/pkg/k8s"
-	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
-	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
-	nodetypes "github.com/cilium/cilium/pkg/node/types"
+	"fmt"
 
 	metallbbgp "go.universe.tf/metallb/pkg/bgp"
 	metallbspr "go.universe.tf/metallb/pkg/speaker"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/cilium/cilium/pkg/cidr"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/ipam/types"
+	"github.com/cilium/cilium/pkg/k8s"
+	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	nodetypes "github.com/cilium/cilium/pkg/node/types"
 )
 
 // GenTestNodeAndAdvertisements generates a v1.Node with its
@@ -25,11 +30,11 @@ import (
 // to simulate it being the node the Cilium agent is running on.
 //
 // See definition for details.
-func GenTestNodeAndAdvertisements() (v1.Node, []*metallbbgp.Advertisement) {
+func GenTestNodeAndAdvertisements() (slim_corev1.Node, []*metallbbgp.Advertisement) {
 	const (
 		CIDR = "1.1.0.0/16"
 	)
-	meta := metav1.ObjectMeta{
+	meta := slim_metav1.ObjectMeta{
 		Name:      nodetypes.GetName(),
 		Namespace: "TestNamespace",
 		Labels: map[string]string{
@@ -37,11 +42,11 @@ func GenTestNodeAndAdvertisements() (v1.Node, []*metallbbgp.Advertisement) {
 		},
 		ResourceVersion: "1",
 	}
-	spec := v1.NodeSpec{
+	spec := slim_corev1.NodeSpec{
 		PodCIDR:  CIDR,
 		PodCIDRs: []string{CIDR},
 	}
-	node := v1.Node{
+	node := slim_corev1.Node{
 		ObjectMeta: meta,
 		Spec:       spec,
 	}
@@ -49,6 +54,46 @@ func GenTestNodeAndAdvertisements() (v1.Node, []*metallbbgp.Advertisement) {
 		{
 			Prefix: cidr.MustParseCIDR(CIDR).IPNet,
 		},
+	}
+	return node, advertisements
+}
+
+// GenTestCiliumNodeAndAdvertisements generates a ciliumv2.CiliumNode with
+// numPodCIDRs podCIDRs and the corresponding MetalLB Advertisements that would
+// be announced by this node.
+//
+// The returned Node's name is set to nodetypes.GetName()
+// to simulate it being the node the Cilium agent is running on.
+//
+// See definition for details.
+func GenTestCiliumNodeAndAdvertisements(numPodCIDRs int) (ciliumv2.CiliumNode, []*metallbbgp.Advertisement) {
+	podCIDRs := make([]string, numPodCIDRs)
+	for i := 0; i < numPodCIDRs; i++ {
+		podCIDRs[i] = fmt.Sprintf("10.%d.0.0/16", i)
+	}
+
+	meta := metav1.ObjectMeta{
+		Name: nodetypes.GetName(),
+		Labels: map[string]string{
+			"TestLabel": "TestLabel",
+		},
+		ResourceVersion: "1",
+	}
+	spec := ciliumv2.NodeSpec{
+		IPAM: types.IPAMSpec{
+			PodCIDRs: podCIDRs,
+		},
+	}
+	node := ciliumv2.CiliumNode{
+		ObjectMeta: meta,
+		Spec:       spec,
+	}
+
+	advertisements := make([]*metallbbgp.Advertisement, 0, numPodCIDRs)
+	for _, podCIDR := range podCIDRs {
+		advertisements = append(advertisements, &metallbbgp.Advertisement{
+			Prefix: cidr.MustParseCIDR(podCIDR).IPNet,
+		})
 	}
 	return node, advertisements
 }
@@ -112,7 +157,8 @@ func GenTestServicePairs() (slim_corev1.Service, v1.Service, metallbspr.Service,
 			LoadBalancer: v1.LoadBalancerStatus{
 				Ingress: []v1.LoadBalancerIngress{
 					{
-						IP: IP,
+						IP:    IP,
+						Ports: nil,
 					},
 				},
 			},
@@ -144,8 +190,8 @@ func GenTestEndpointsPairs() (k8s.Endpoints, slim_corev1.Endpoints, metallbspr.E
 	backend := k8s.Backend{
 		NodeName: NodeName,
 	}
-	backends := map[string]*k8s.Backend{
-		IP: &backend,
+	backends := map[cmtypes.AddrCluster]*k8s.Backend{
+		cmtypes.MustParseAddrCluster(IP): &backend,
 	}
 	endpoints := k8s.Endpoints{Backends: backends}
 	slimEndpoints := slim_corev1.Endpoints{
